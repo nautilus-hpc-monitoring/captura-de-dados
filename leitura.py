@@ -1,4 +1,5 @@
 import csv
+import exibicao as ex
 from datetime import datetime
 
 cabecalho = [
@@ -35,23 +36,6 @@ cabecalho = [
     'DISCO_USADO',
     'DISCO_LIVRE'
 ]
-
-
-# Exibição
-def titulo(texto: str):
-    print("\n" + "=" * 65)
-    print(f"{texto:^65}")
-    print("=" * 65)
-
-
-def subtitulo(texto: str):
-    print(f"\n{texto}")
-    print("-" * 65)
-
-
-def resultado(nome: str, valor: float, unidade: str = "", casas: int = 2):
-    print(f"{nome:<40} {valor:>15.{casas}f} {unidade}")
-
 
 # Funções gerais
 def media_interv_min(lista: list, minutos: int, key: str) -> float:
@@ -380,154 +364,154 @@ def main():
         print("Nenhum dado encontrado.")
         return
 
-    titulo("RELATÓRIO DE MONITORAMENTO")
+    ex.titulo("RELATÓRIO DE MONITORAMENTO")
 
     print(f"Registros: {len(dados)}")
     print(f"Início: {dados[0]['TIMESTAMP']}")
     print(f"Fim:    {dados[-1]['TIMESTAMP']}")
 
     # CPU
-    titulo("CPU")
+    ex.titulo("CPU")
 
-    resultado(
+    ex.resultado(
         "Uso médio geral:",
         media_cpu_geral(dados),
         "%"
     )
 
-    resultado(
+    ex.resultado(
         "Uso médio últimos 30 min:",
         media_cpu_30_min(dados),
         "%"
     )
 
-    resultado(
+    ex.resultado(
         "Uso médio último dia:",
         media_cpu_1_dia(dados),
         "%"
     )
 
-    resultado(
+    ex.resultado(
         "CPU em user:",
         media_cpu_user(dados),
         "%"
     )
 
-    resultado(
+    ex.resultado(
         "CPU em system:",
         media_cpu_system(dados),
         "%"
     )
 
-    resultado(
+    ex.resultado(
         "CPU ociosa:",
         media_cpu_idle(dados),
         "%"
     )
 
-    resultado(
+    ex.resultado(
         "CPU aguardando I/O:",
         media_cpu_iowait(dados),
         "%"
     )
 
-    resultado(
+    ex.resultado(
         "Interrupções por segundo:",
         interrupcoes_por_segundo(dados),
         "int/s"
     )
 
-    resultado(
+    ex.resultado(
         "Frequência média:",
         media_frequencia_cpu(dados),
         "MHz"
     )
 
-    resultado(
+    ex.resultado(
         "Load Average 1 min:",
         media_load_1(dados)
     )
 
-    resultado(
+    ex.resultado(
         "Load Average 5 min:",
         media_load_5(dados)
     )
 
-    resultado(
+    ex.resultado(
         "Load Average 15 min:",
         media_load_15(dados)
     )
 
     # RAM
-    titulo("RAM")
+    ex.titulo("RAM")
 
-    resultado(
+    ex.resultado(
         "Uso médio:",
         media_ram_percent(dados),
         "%"
     )
 
-    resultado(
+    ex.resultado(
         "RAM disponível média:",
         media_ram_disponivel(dados),
         "bytes"
     )
 
-    resultado(
+    ex.resultado(
         "RAM usada média:",
         media_ram_usada(dados),
         "bytes"
     )
 
     # SWAP
-    titulo("SWAP")
+    ex.titulo("SWAP")
 
-    resultado(
+    ex.resultado(
         "Uso médio:",
         media_swap_percent(dados),
         "%"
     )
 
-    resultado(
+    ex.resultado(
         "Swap IN:",
         swap_in_por_segundo(dados),
         "bytes/s"
     )
 
-    resultado(
+    ex.resultado(
         "Swap OUT:",
         swap_out_por_segundo(dados),
         "bytes/s"
     )
 
     # DISCO
-    titulo("DISCO")
+    ex.titulo("DISCO")
 
-    resultado(
+    ex.resultado(
         "Uso médio:",
         media_disco_percent(dados),
         "%"
     )
 
-    resultado(
+    ex.resultado(
         "Espaço usado médio:",
         media_disco_usado(dados),
         "bytes"
     )
 
-    resultado(
+    ex.resultado(
         "Espaço livre médio:",
         media_disco_livre(dados),
         "bytes"
     )
 
-    resultado(
+    ex.resultado(
         "Crescimento:",
         crescimento_espaco_disco(dados),
         "%"
     )
 
-    titulo("FIM")
+    ex.titulo("FIM")
 
 
 main()
