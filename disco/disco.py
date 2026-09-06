@@ -11,14 +11,14 @@ def media_disco_percent(lista: list):
 def media_disco_livre(lista: list):
     return fg.media_uso_componente(
         lista,
-        "DISCO_LIVRE"
+        "DISCO_FREE"
     )
 
 
 def media_disco_usado(lista: list):
     return fg.media_uso_componente(
         lista,
-        "DISCO_USADO"
+        "DISCO_USED"
     )
 
 
@@ -27,11 +27,11 @@ def crescimento_espaco_disco(lista: list):
         return 0
 
     usado_inicio = float(
-        lista[0]["DISCO_USADO"]
+        lista[0]["DISCO_USED"]
     )
 
     usado_fim = float(
-        lista[-1]["DISCO_USADO"]
+        lista[-1]["DISCO_USED"]
     )
 
     if usado_inicio == 0:

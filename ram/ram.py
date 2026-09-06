@@ -14,7 +14,6 @@ def media_ram_disponivel(lista: list):
         "RAM_AVAILABLE"
     )
 
-
 def media_ram_usada(lista: list):
     return fg.media_uso_componente(
         lista,
