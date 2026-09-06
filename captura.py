@@ -8,127 +8,243 @@ from datetime import datetime
 
 # Configurar as variáveis de ambiente pra API pra cahamar commais facilidade posteriormente
 API_BASE_URL = "http://localhost:3333/empresa"
+
 # Diz qual o id da empresa correspondente ao node ou cluster
 ID_EMPRESA = 1
 
-def buscar_parametros_cliente(id_empresa):
+NOME_MAQUINA = socket.gethostname()
+NOME_USUARIO = os.environ.get('USER')
+
+def buscar_metricas_cliente(id_empresa):
     # Usa a nossa API pra pegar os "comando_parametro" que foram cadastrados pra empresa
     try:
         resposta = requests.get(f"{API_BASE_URL}/{id_empresa}")
+
         if resposta.status_code == 200:
-            dados = resposta.json()
-            # Seleciona os parametros que vieram do model da empresa
-            parametros = [item['comando_parametro'] for item in dados if 'comando_parametro' in item]
-            print(f"Parâmetros ativos carregados da API: {parametros}")
-            return parametros
+            metricas = resposta.json()
+            # Seleciona as métricas que vieram do model da empresa
+            print(f"{len(metricas)} métricas carregadas.\n")
+            return metricas
         else:
             print(f"Houve um erro ao consultar a nossa API: ({resposta.status_code}). Utilizando captura padrão.")
             return []
+
     except Exception as e:
         print(f"Falha de conexão com a nossa API: {e}")
         return []
 
-# Pega a lista de filtros da API quando coomeça
-parametros_ativos = buscar_parametros_cliente(ID_EMPRESA)
+# Converte os valores da coluna "argumento_valor" do banco para o que o psutil necessita
+def converter_valor(valor):
 
-usuario = os.environ.get('USER')
+    # Se não veio argumento, não converte
+    if valor is None:
+        return None
 
-while True:
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    # Verifica o tipo
+    if not isinstance(valor, str):
+        return valor
+    
+    # Remove espaços do início e do fim
+    valor = valor.strip()
 
-    # Esse dicionário dinâmico já guarda os campos de forma padronizada
-    registro = {
-        'TIMESTAMP': timestamp,
-        'USUARIO': usuario
+    if valor.lower() == "true":
+        return True
+
+    if valor.lower() == "false":
+        return False
+    
+    if valor.lower() == "none":
+        return None
+    
+    # Tenta converter para inteiro
+    try:
+        return int(valor)
+    except ValueError:
+        pass
+
+    # Tenta convereter para float
+    try:
+        return float(valor)
+    except ValueError:
+        pass
+
+    # Caso nenhuma conversão funcione, retorna como texto
+    return valor
+
+# {
+#    "funcao_psutil": "cpu_count",
+#    "argumento_nome": "logical",
+#    "argumento_valor": "true"
+# }
+# Precisa virar -> p.cpu_count(logica=true)
+#
+# Monta os parâmetros que são enviados para a função do psutil
+def montar_argumentos(metrica):
+    nome = metrica.get("argumento_nome")
+    valor = converter_valor(metrica.get("argumento_valor"))
+
+    # Retorna um dicionário montado com o nome e o valor do argumento
+    if nome is None:
+        return {}
+
+    return {
+        nome: valor
     }
 
-    # Filtro da CPU
-    # Se tiver alguma dessas colunas em maiúsculo...
-    if any(param in parametros_ativos for param in ['CPU_PERCENT', 'CPU_USER_PERCENT', 'CPU_SYSTEM_PERCENT', 'CPU_IDLE_PERCENT', 'CPU_IOWAIT_PERCENT']):
+# Executa a função do psutil de forma dinâmica a partir da montagem dos argumentos
+def executar_funcao(metrica, cache):
+    nome_funcao = metrica["funcao_psutil"]
 
-        # Faz a captura pra cada parâmetro
-        if 'CPU_PERCENT' in parametros_ativos:
-            registro['CPU_PERCENT'] = p.cpu_percent()
-        
-        cpu_times = p.cpu_times_percent()
-        if 'CPU_USER_PERCENT' in parametros_ativos:
-            registro['CPU_USER_PERCENT'] = cpu_times.user
-        if 'CPU_SYSTEM_PERCENT' in parametros_ativos:
-            registro['CPU_SYSTEM_PERCENT'] = cpu_times.system
-        if 'CPU_IDLE_PERCENT' in parametros_ativos:
-            registro['CPU_IDLE_PERCENT'] = cpu_times.idle
-        if 'CPU_IOWAIT_PERCENT' in parametros_ativos:
-            registro['CPU_IOWAIT_PERCENT'] = cpu_times.iowait
+    argumentos = montar_argumentos(metrica)
 
-    if 'CPU_INTERRUPTS' in parametros_ativos:
-        registro['CPU_INTERRUPTS'] = p.cpu_stats().interrupts
+    # Monta uma tupla que armazena a funcao e os argumentos para poder diferenciar a mesma função com argumentos diferentes
+    # Exemplo: p.cpu_count(logical=True) e p.cpu_count(logical=False) são chamadas diferentes da mesma função
+    chave_cache = (
+        nome_funcao,
 
-    if 'CPU_FREQ_ATUAL' in parametros_ativos:
-        registro['CPU_FREQ_ATUAL'] = p.cpu_freq().current
+        # Ordena de forma crescente os valores da lista de argumentos e coloca em uma tupla para poder ser usada como chave do dicionário
+        tuple(sorted(argumentos.items()))
+    )
 
-    # Filtro da LOAD AVERAGE
-    if any(param in parametros_ativos for param in ['LOAD_AVG_1', 'LOAD_AVG_5', 'LOAD_AVG_15']):
-        load = p.getloadavg()
-        if 'LOAD_AVG_1' in parametros_ativos:
-            registro['LOAD_AVG_1'] = load[0]
-        if 'LOAD_AVG_5' in parametros_ativos:
-            registro['LOAD_AVG_5'] = load[1]
-        if 'LOAD_AVG_15' in parametros_ativos:
-            registro['LOAD_AVG_15'] = load[2]
+    # Caso a função ainda não tenha sido chamada, ele executa
+    if chave_cache not in cache:
 
-    # Filtro da RAM
-    if any(param in parametros_ativos for param in ['RAM_PERCENT', 'RAM_TOTAL', 'RAM_AVAILABLE', 'RAM_USED', 'RAM_FREE']):
-        ram = p.virtual_memory()
-        if 'RAM_PERCENT' in parametros_ativos:
-            registro['RAM_PERCENT'] = ram.percent
-        if 'RAM_TOTAL' in parametros_ativos:
-            registro['RAM_TOTAL'] = ram.total
-        if 'RAM_AVAILABLE' in parametros_ativos:
-            registro['RAM_AVAILABLE'] = ram.available
-        if 'RAM_USED' in parametros_ativos:
-            registro['RAM_USED'] = ram.used
-        if 'RAM_FREE' in parametros_ativos:
-            registro['RAM_FREE'] = ram.free
+        # Executa a função de forma conceitual, onde o getattr acesso o atributo de um objeto usando o nome dele em forma de texto
+        # nome_funcao = "cpu_percent"
+        # funcao = p.cpu_percent        
+        funcao = getattr(p, nome_funcao)
 
-    # filtro SWAP
-    if any(param in parametros_ativos for param in ['SWAP_PERCENT', 'SWAP_USED', 'SWAP_FREE', 'SWAP_IN', 'SWAP_OUT']):
-        swap = p.swap_memory()
-        if 'SWAP_PERCENT' in parametros_ativos:
-            registro['SWAP_PERCENT'] = swap.percent
-        if 'SWAP_USED' in parametros_ativos:
-            registro['SWAP_USED'] = swap.used
-        if 'SWAP_FREE' in parametros_ativos:
-            registro['SWAP_FREE'] = swap.free
-        if 'SWAP_IN' in parametros_ativos:
-            registro['SWAP_IN'] = swap.sin
-        if 'SWAP_OUT' in parametros_ativos:
-            registro['SWAP_OUT'] = swap.sout
+        # **argumentos é equivalente a 
+        # argumentos = {
+        #     "logical": True
+        # }
+        # assim funcao(**argumentos) é equivalente a funcao(logical=True)
+        cache[chave_cache] = funcao(**argumentos)
 
-    # Filtro DISCO
-    if any(param in parametros_ativos for param in ['DISCO_PERCENT', 'DISCO_USED', 'DISCO_FREE']):
-        disco = p.disk_usage('/')
-        if 'DISCO_PERCENT' in parametros_ativos:
-            registro['DISCO_PERCENT'] = disco.percent
-        if 'DISCO_USED' in parametros_ativos:
-            registro['DISCO_USED'] = disco.used
-        if 'DISCO_FREE' in parametros_ativos:
-            registro['DISCO_FREE'] = disco.free
+    return cache[chave_cache]
 
-    # Guarda no arquivo csv com as colunas dinâmicas ou imprime os dados
-    nome_maquina = socket.gethostname()
-    nome_arquivo = f'./nautilus_coleta_{nome_maquina}.csv'
+# O retorno seria parecido com isso
+# cache = {
+#     ("virtual_memory", ()):
+#         svmem(
+#             total=16777216000,
+#             available=8245000000,
+#             percent=50.8,
+#             used=7450000000,
+#             free=2100000000
+#         ),
 
-    arquivo_existe = os.path.exists(nome_arquivo)
-    
-    with open(nome_arquivo, 'a', newline='', encoding='utf-8') as csvfile:
-        escritor = csv.DictWriter(csvfile, fieldnames=registro.keys(), delimiter=';')
-        
-        # Cria o cabeçalho só se o arquivo for novo
-        if not arquivo_existe:
-            escritor.writeheader()
-        escritor.writerow(registro)
+#     (
+#         "cpu_count",
+#         (
+#             ("logical", True),
+#         )
+#     ): 16,
 
-    # Coloquei um retorno no terminal pra hora da apresentação
-    print(f"{timestamp} - Captura salva na máquina {nome_maquina}: {registro}")
+#     (
+#         "cpu_count",
+#         (
+#             ("logical", False),
+#         )
+#     ): 8
+# }
 
-    time.sleep(1)
+# Verifica qual campo deve ser retornado da função do psutil
+def extrair_retorno(resultado, metrica):
+    atributo = metrica.get("atributo_retorno")
+    indice = metrica.get("indice_retorno")
+
+    # Equivalente a resultado = resultado.atributo, porque algumas funções do psutil retornam objetos com atributos
+    if atributo is not None:
+        resultado = getattr(resultado, atributo)
+
+    # Equivalente a resultado = resultado[indice], porque algumas funções do psutil retornam listas ou tuplas
+    if indice is not None:
+        resultado = resultado[indice]
+
+    return resultado
+
+def capturar_metrica(metrica, cache):
+    try:
+
+        # Executa a função do psutil
+        resultado = executar_funcao(metrica, cache)
+
+        # Pega o valor específico desejado
+        resultado = extrair_retorno(resultado, metrica)
+
+        return resultado
+
+    except (
+        AttributeError,
+        IndexError,
+        TypeError,
+        OSError
+    ) as erro:
+
+        print(
+            f"Não foi possível capturar "
+            f"{metrica['nome_coluna']}: {erro}"
+        )
+
+        return None
+
+def capturar_dados(metricas):
+    # Criar um cache para armazenar os resultados a cada rodada e evitar chamadas repetidas
+    cache = {}
+
+    dados = {
+        "TIMESTAMP": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        "USUARIO": NOME_USUARIO,
+        "HOSTNAME": NOME_MAQUINA
+    }
+
+    for metrica in metricas:
+        coluna = metrica["nome_coluna"]
+
+        dados[coluna] = capturar_metrica(metrica, cache)
+
+    return dados
+
+metricas = buscar_metricas_cliente(ID_EMPRESA)
+
+if not metricas:
+    print("Nenhuma métrica configurada")
+    exit()
+
+# Colunas padrão
+colunas = [
+        "TIMESTAMP",
+        "USUARIO",
+        "HOSTNAME"
+]
+
+# Colunas das métricas do banco
+colunas.extend(metrica["nome_coluna"] for metrica in metricas)
+
+caminho_arquivo = f'./nautilus_coleta_{NOME_MAQUINA}.csv'
+
+arquivo_existe = os.path.exists(caminho_arquivo)
+arquivo = open(caminho_arquivo, "a", newline="", encoding="utf-8")
+
+escritor = csv.DictWriter(arquivo, fieldnames=colunas)
+
+if not arquivo_existe:
+    escritor.writeheader()
+
+try:
+    while True:
+        dados = capturar_dados(metricas)
+
+        escritor.writerow(dados)
+        arquivo.flush()
+
+        print(f"{dados['TIMESTAMP']} - Captura salva na máquina {NOME_MAQUINA}: {dados}")
+
+        time.sleep(1)
+
+except KeyboardInterrupt:
+    print("\nMonitoramento encerrado.")
+
+finally:
+    arquivo.close()
