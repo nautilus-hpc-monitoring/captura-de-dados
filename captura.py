@@ -3,6 +3,7 @@ import csv
 import time
 import os
 import json
+import uuid # para pegar o endereço mac da máquina
 import requests # add pra comunicação com a api
 import socket # add pra pegar o nome do pc
 from datetime import datetime
@@ -15,6 +16,19 @@ ARQUIVO_CONFIG = "config.json"
 
 NOME_MAQUINA = socket.gethostname()
 NOME_USUARIO = os.environ.get('USER')
+
+def obter_endereco_mac():
+    interfaces = p.net_if_addrs()
+
+    for nome_interface, enderecos in interfaces.items():
+        for endereco in enderecos:
+
+            # family é o tipo de endereço, p.AF_LINK é o tipo de endereço MAC
+            if endereco.family == p.AF_LINK:
+                if endereco.address != "00:00:00:00:00:00":
+                    return endereco.address.upper()
+
+    return None
 
 # Função para carregar o arquivo de configuração
 def carregar_config():
@@ -31,10 +45,13 @@ def salvar_config(config):
         json.dump(config, arquivo, indent=4)
 
 # Função para verificar se o node já está registrado
-def registrar_node(token_instalacao):
+def ativarAgente(token_instalacao):
+    endereco_mac = obter_endereco_mac()
+
     dados = {
         "tokenInstalacaoServer": token_instalacao,
-        "hostnameServer": NOME_MAQUINA
+        "hostnameServer": NOME_MAQUINA,
+        "enderecoMacServer": endereco_mac
     }
 
     resposta = requests.post(f"{API_BASE_URL}/nodes/ativarAgente", json=dados)
@@ -42,9 +59,11 @@ def registrar_node(token_instalacao):
     if resposta.status_code == 200:
         retorno = resposta.json()
 
+        print(f"Agente ativado no MAC {endereco_mac}")
+
         return retorno.get("tokenNode")
 
-    print("Erro ao registrar node")
+    print("Erro ao ativar agente")
     print(resposta.text)
 
     return None
@@ -71,6 +90,8 @@ def buscar_metricas_cliente(token_node):
     except Exception as e:
         print(f"Falha de conexão com a API: {e}")
         return []
+
+
 
 # Converte os valores da coluna "argumento_valor" do banco para o que o psutil necessita
 def converter_valor(valor):
@@ -245,12 +266,10 @@ def capturar_dados(metricas):
 
     return dados
 
-
 config = carregar_config()
 
 token_node = config.get("token_node")
 
-# Se o token do node não estiver presente no arquivo de configuração, significa que é a primeira execução do node e ele precisa ser registrado
 if token_node is None:
     token_instalacao = config.get("token_instalacao")
 
@@ -258,24 +277,24 @@ if token_node is None:
         print("Token de instalação não encontrado no arquivo de configuração.")
         exit()
 
-    print("Primeira execução do node. Registrando node...")
+    print("Primeira execução do agente. Ativando...")
 
-    token_node = registrar_node(token_instalacao)
+    token_node = ativarAgente(token_instalacao)
 
     if token_node is None:
-        print("Não foi possível registrar o node.")
+        print("Não foi possível ativar o agente.")
         exit()
 
     config = {
-        "token_node": token_node,
+        "token_node": token_node
     }
 
     salvar_config(config)
 
-    print("Node registrado com sucesso. Token do node salvo no arquivo de configuração.")
+    print("Agente ativado com sucesso.")
 
 else:
-    print("Node já registrado. Token do node encontrado no arquivo de configuração.")
+    print("Agente já ativado. Token do node encontrado.")
 
 metricas = buscar_metricas_cliente(token_node)
 

@@ -1,6 +1,9 @@
 import csv
 import utils.exibicao as ex
 import cpu.cpu as cpu
+import socket # add pra pegar o nome do pc
+
+NOME_MAQUINA = socket.gethostname()
 
 # Leitura do CSV
 def ler_csv(nome_arquivo: str) -> list:
@@ -20,7 +23,7 @@ def ler_csv(nome_arquivo: str) -> list:
     return dados
 
 def main():
-    dados = ler_csv('nautilus_coleta_raphael.csv')
+    dados = ler_csv(f'nautilus_coleta_{NOME_MAQUINA}.csv')
 
     if len(dados) == 0:
         print("Nenhum dado encontrado.")
