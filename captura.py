@@ -2,23 +2,81 @@ import psutil as p
 import csv
 import time
 import os
+import json
+import uuid # para pegar o endereço mac da máquina
 import requests # add pra comunicação com a api
 import socket # add pra pegar o nome do pc
 from datetime import datetime
 
 # Configurar as variáveis de ambiente pra API pra cahamar commais facilidade posteriormente
-API_BASE_URL = "http://localhost:3333/empresa"
+API_BASE_URL = "http://localhost:3334"
 
-# Diz qual o id da empresa correspondente ao node ou cluster
-ID_EMPRESA = 1
+# Token de instalação ou token do node, que será salvo no arquivo de configuração
+ARQUIVO_CONFIG = "config.json"
 
 NOME_MAQUINA = socket.gethostname()
 NOME_USUARIO = os.environ.get('USER')
 
-def buscar_metricas_cliente(id_empresa):
-    # Usa a nossa API pra pegar os "comando_parametro" que foram cadastrados pra empresa
+def obter_endereco_mac():
+    interfaces = p.net_if_addrs()
+
+    for nome_interface, enderecos in interfaces.items():
+        for endereco in enderecos:
+
+            # family é o tipo de endereço, p.AF_LINK é o tipo de endereço MAC
+            if endereco.family == p.AF_LINK:
+                if endereco.address != "00:00:00:00:00:00":
+                    return endereco.address.upper()
+
+    return None
+
+# Função para carregar o arquivo de configuração
+def carregar_config():
+    if not os.path.exists(ARQUIVO_CONFIG):
+        print(f"Arquivo de configuração '{ARQUIVO_CONFIG}' não encontrado.")
+        exit()
+
+    with open(ARQUIVO_CONFIG, 'r', encoding='utf-8') as arquivo:
+        return json.load(arquivo)
+
+# Função para salvar o token do node no arquivo de configuração
+def salvar_config(config):
+    with open(ARQUIVO_CONFIG, "w", encoding="utf-8") as arquivo:
+        json.dump(config, arquivo, indent=4)
+
+# Função para verificar se o node já está registrado
+def ativarAgente(token_instalacao):
+    endereco_mac = obter_endereco_mac()
+
+    dados = {
+        "tokenInstalacaoServer": token_instalacao,
+        "hostnameServer": NOME_MAQUINA,
+        "enderecoMacServer": endereco_mac
+    }
+
+    resposta = requests.post(f"{API_BASE_URL}/nodes/ativarAgente", json=dados)
+
+    if resposta.status_code == 200:
+        retorno = resposta.json()
+
+        print(f"Agente ativado no MAC {endereco_mac}")
+
+        return retorno.get("tokenNode")
+
+    print("Erro ao ativar agente")
+    print(resposta.text)
+
+    return None
+
+def buscar_metricas_cliente(token_node):
+    # Usa a nossa API pra pegar os "comando_parametro" que foram cadastrados pra empresa através do token do node
     try:
-        resposta = requests.get(f"{API_BASE_URL}/{id_empresa}")
+        resposta = requests.get(
+            f"http://localhost:3335/empresa/metricas",
+            headers={
+                "Authorization": f"Bearer {token_node}"
+            }
+        )
 
         if resposta.status_code == 200:
             metricas = resposta.json()
@@ -26,12 +84,14 @@ def buscar_metricas_cliente(id_empresa):
             print(f"{len(metricas)} métricas carregadas.\n")
             return metricas
         else:
-            print(f"Houve um erro ao consultar a nossa API: ({resposta.status_code}). Utilizando captura padrão.")
+            print(f"Houve um erro ao consultar as métricas: ({resposta.status_code}).")
             return []
 
     except Exception as e:
-        print(f"Falha de conexão com a nossa API: {e}")
+        print(f"Falha de conexão com a API: {e}")
         return []
+
+
 
 # Converte os valores da coluna "argumento_valor" do banco para o que o psutil necessita
 def converter_valor(valor):
@@ -206,7 +266,37 @@ def capturar_dados(metricas):
 
     return dados
 
-metricas = buscar_metricas_cliente(ID_EMPRESA)
+config = carregar_config()
+
+token_node = config.get("token_node")
+
+if token_node is None:
+    token_instalacao = config.get("token_instalacao")
+
+    if token_instalacao is None:
+        print("Token de instalação não encontrado no arquivo de configuração.")
+        exit()
+
+    print("Primeira execução do agente. Ativando...")
+
+    token_node = ativarAgente(token_instalacao)
+
+    if token_node is None:
+        print("Não foi possível ativar o agente.")
+        exit()
+
+    config = {
+        "token_node": token_node
+    }
+
+    salvar_config(config)
+
+    print("Agente ativado com sucesso.")
+
+else:
+    print("Agente já ativado. Token do node encontrado.")
+
+metricas = buscar_metricas_cliente(token_node)
 
 if not metricas:
     print("Nenhuma métrica configurada")
