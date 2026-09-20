@@ -6,8 +6,17 @@ import csv
 import datetime
 import socket
 
+start_msg = '''
+=========================================================================
+                REALIZE SUA AUTENTICAÇÃO PARA PROSSEGUIR!
+=========================================================================
+'''
+
+print(start_msg)
+
 email = input('Email: ')
 password = input('Senha: ')
+
 host = socket.gethostname()
 url_auth = "http://localhost:3000/api/autenticacao"
 
@@ -140,24 +149,20 @@ try:
     print(resultado)
 
     if resultado.get("autenticado"):
-
-        print("Autenticação realizada com sucesso!")
+        print("\nAutenticação realizada com sucesso!")
         print("Hostname:", resultado["mainframe"]["hostname"])
 
-        componentes = resultado["componentes"]
-
+        componentes = resultado["componentes\n"]
         authComponentes(componentes)
 
         escrita()
 
     else:
-        print("Falha na autenticação.")
+        print("Falha na autenticação! Email e/ou senha incorretos")
 
 except requests.exceptions.HTTPError as erro:
-
     print("Erro na autenticação:", erro)
 
 except requests.exceptions.RequestException as erro:
-
     print("Não foi possível conectar à API:", erro)
 
