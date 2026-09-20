@@ -92,6 +92,7 @@ def coletar_disco():
 
 cabecalho = [
     'TIMESTAMP',
+    'HOSTNAME',
     'USER',
 
     'CPU_PERCENT',
@@ -137,6 +138,7 @@ def escrita():
 
         linha = [
             timestamp,
+            host,
             usuario,
 
             *cpu,
