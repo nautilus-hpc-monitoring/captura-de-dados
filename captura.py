@@ -12,11 +12,20 @@ host = socket.gethostname()
 url_auth = "http://localhost:3000/api/autenticacao"
 
 flags_monitoramento = {}
-dados = []
 
 def authComponentes(componentes):
     for componente in componentes:
         flags_monitoramento[componente['type']] = True
+
+def coletar_cpu():
+    return {
+        "percent": p.cpu_percent(),
+        "times": p.cpu_times_percent(),
+        "stats": p.cpu_stats(),
+        "freq": p.cpu_freq(),
+        "count": p.cpu_count(),
+        "load": p.getloadavg()
+    }
 
 cabecalho = [
     'TIMESTAMP',
@@ -24,68 +33,32 @@ cabecalho = [
 
     'CPU_PERCENT',
     'CPU_USER_PERCENT',
-    'CPU_NICE_PERCENT',
     'CPU_SYSTEM_PERCENT',
     'CPU_IDLE_PERCENT',
     'CPU_IOWAIT_PERCENT',
-    'CPU_IRQ_PERCENT',
-    'CPU_SOFTIRQ_PERCENT',
-    'CPU_STEAL_PERCENT',
-    'CPU_GUEST_PERCENT',
-    'CPU_GUEST_NICE_PERCENT',
-
     'CPU_FREQ_ATUAL',
-    'CPU_FREQ_MIN',
-    'CPU_FREQ_MAX',
-
     'CPU_COUNT_LOGICA',
-    'CPU_COUNT_FISICA',
-
-    'CPU_CTX_SWITCHES',
-    'CPU_INTERRUPTS',
-    'CPU_SOFT_INTERRUPTS',
-    'CPU_SYSCALLS',
-
     'LOAD_AVG_1',
     'LOAD_AVG_5',
     'LOAD_AVG_15',
 
+    'RAM_PERCENT',
     'RAM_TOTAL',
     'RAM_AVAILABLE',
-    'RAM_PERCENT',
     'RAM_USED',
-    'RAM_FREE',
-    'RAM_ACTIVE',
-    'RAM_INACTIVE',
-    'RAM_BUFFERS',
-    'RAM_CACHED',
-    'RAM_SHARED',
-    'RAM_SLAB',
 
-    'SWAP_TOTAL',
+    'SWAP_PERCENT',
     'SWAP_USED',
     'SWAP_FREE',
-    'SWAP_PERCENT',
     'SWAP_IN',
     'SWAP_OUT',
 
+    'DISCO_PERCENT',
     'DISCO_TOTAL',
     'DISCO_USED',
-    'DISCO_FREE',
-    'DISCO_PERCENT',
-
-    'DISCO_READ_COUNT',
-    'DISCO_WRITE_COUNT',
-    'DISCO_READ_BYTES',
-    'DISCO_WRITE_BYTES',
-    'DISCO_READ_TIME',
-    'DISCO_WRITE_TIME',
-    'DISCO_READ_MERGED_COUNT',
-    'DISCO_WRITE_MERGED_COUNT',
-    'DISCO_BUSY_TIME'
+    'DISCO_FREE'
 ]
 usuario = os.environ.get('USER')
-
 
 def escrita():
     with open('./data.csv', 'w', newline='') as csvfile:
@@ -94,50 +67,57 @@ def escrita():
     while True:
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-        cpu_percent = p.cpu_percent()
-        cpu_times = p.cpu_times_percent()
-        cpu_stats = p.cpu_stats()
-        cpu_freq = p.cpu_freq()
+        if flags_monitoramento.get('CPU', False):
+            cpu = coletar_cpu()
+        else:
+            cpu = None
 
-        load = p.getloadavg()
+        if flags_monitoramento.get('RAM', False):
+            ram = p.virtual_memory()
+        else:
+            ram = 0
 
-        ram = p.virtual_memory()
-        swap = p.swap_memory()
-        disco = p.disk_usage('/')
+        if flags_monitoramento.get('SWAP', False):
+            swap = p.swap_memory()
+            
+        else:
+            swap = 0
 
+        if flags_monitoramento.get('DISCO', False):
+            disco = p.disk_usage('/')
+        else: 
+            disco = 0
+            
         dados = [
             timestamp,
             usuario,
 
-            cpu_percent,
-            cpu_times.user,
-            cpu_times.system,
-            cpu_times.idle,
-            cpu_times.iowait,
+        cpu["percent"],
+        cpu["times"].user,
+        cpu["times"].system,
+        cpu["times"].idle,
+        cpu["times"].iowait,
+        cpu["freq"].current,
+        cpu["count"],
+        cpu["load"][0],
+        cpu["load"][1],
+        cpu["load"][2],
 
-            cpu_stats.interrupts,
+        ram.percent,
+        ram.total,
+        ram.available,
+        ram.used,
 
-            cpu_freq.current,
+        swap.percent,
+        swap.used,
+        swap.free,
+        swap.sin,
+        swap.sout,
 
-            load[0],
-            load[1],
-            load[2],
-
-            ram.percent,
-            ram.total,
-            ram.available,
-            ram.used,
-            ram.free,
-
-            swap.percent,
-            swap.used,
-            swap.free,
-            swap.sin,
-            swap.sout,
-
-            disco.percent,
-            disco.used,
-            disco.free
+        disco.percent,
+        disco.total,
+        disco.used,
+        disco.free
     ]
 
         with open('./data.csv', 'a', newline='') as csvfile:
@@ -168,7 +148,7 @@ try:
 
         authComponentes(componentes)
 
-        #escrita()
+        escrita()
 
     else:
         print("Falha na autenticação.")
