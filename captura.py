@@ -3,7 +3,7 @@ import psutil as p
 import os
 import time
 import csv
-import datetime
+from datetime import datetime
 import socket
 
 start_msg = '''
@@ -21,20 +21,74 @@ host = socket.gethostname()
 url_auth = "http://localhost:3000/api/autenticacao"
 
 flags_monitoramento = {}
+dados = []
 
 def authComponentes(componentes):
     for componente in componentes:
-        flags_monitoramento[componente['type']] = True
+        flags_monitoramento[componente['tipo']] = True
 
 def coletar_cpu():
-    return {
-        "percent": p.cpu_percent(),
-        "times": p.cpu_times_percent(),
-        "stats": p.cpu_stats(),
-        "freq": p.cpu_freq(),
-        "count": p.cpu_count(),
-        "load": p.getloadavg()
-    }
+    if flags_monitoramento.get('CPU', False):
+        cpu_times = p.cpu_times_percent()
+        cpu_freq = p.cpu_freq()
+
+        return [
+            p.cpu_percent(),
+            cpu_times.user,
+            cpu_times.system,
+            cpu_times.idle,
+            cpu_times.iowait,
+            cpu_freq.current,
+            p.cpu_count(),
+            p.getloadavg()[0],
+            p.getloadavg()[1],
+            p.getloadavg()[2]
+        ]
+
+    return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+
+def coletar_ram():
+    if flags_monitoramento.get('RAM', False):
+        ram = p.virtual_memory()
+
+        return [
+            ram.percent,
+            ram.total,
+            ram.available,
+            ram.used
+        ]
+
+    return [0, 0, 0, 0]
+
+
+def coletar_swap():
+    if flags_monitoramento.get('SWAP', False):
+        swap = p.swap_memory()
+
+        return [
+            swap.percent,
+            swap.used,
+            swap.free,
+            swap.sin,
+            swap.sout
+        ]
+
+    return [0, 0, 0, 0, 0]
+
+
+def coletar_disco():
+    if flags_monitoramento.get('DISCO', False):
+        disco = p.disk_usage('/')
+
+        return [
+            disco.percent,
+            disco.total,
+            disco.used,
+            disco.free
+        ]
+
+    return [0, 0, 0, 0]
 
 cabecalho = [
     'TIMESTAMP',
@@ -76,61 +130,27 @@ def escrita():
     while True:
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-        if flags_monitoramento.get('CPU', False):
-            cpu = coletar_cpu()
-        else:
-            cpu = None
+        cpu = coletar_cpu()
+        ram = coletar_ram()
+        swap = coletar_swap()
+        disco = coletar_disco()
 
-        if flags_monitoramento.get('RAM', False):
-            ram = p.virtual_memory()
-        else:
-            ram = 0
-
-        if flags_monitoramento.get('SWAP', False):
-            swap = p.swap_memory()
-            
-        else:
-            swap = 0
-
-        if flags_monitoramento.get('DISCO', False):
-            disco = p.disk_usage('/')
-        else: 
-            disco = 0
-            
-        dados = [
+        linha = [
             timestamp,
             usuario,
 
-        cpu["percent"],
-        cpu["times"].user,
-        cpu["times"].system,
-        cpu["times"].idle,
-        cpu["times"].iowait,
-        cpu["freq"].current,
-        cpu["count"],
-        cpu["load"][0],
-        cpu["load"][1],
-        cpu["load"][2],
+            *cpu,
+            *ram,
+            *swap,
+            *disco
+        ]
 
-        ram.percent,
-        ram.total,
-        ram.available,
-        ram.used,
-
-        swap.percent,
-        swap.used,
-        swap.free,
-        swap.sin,
-        swap.sout,
-
-        disco.percent,
-        disco.total,
-        disco.used,
-        disco.free
-    ]
+        dados.append(linha)
+        print(linha)
 
         with open('./data.csv', 'a', newline='') as csvfile:
             csv.writer(csvfile, delimiter=';').writerow(dados)
+
 
         time.sleep(10)
 
@@ -145,14 +165,14 @@ try:
     )
     res.raise_for_status()
 
-    resultado = res.json()
-    print(resultado)
+    res = res.json()
+    print(res)
 
-    if resultado.get("autenticado"):
+    if res.get("autenticado"):
         print("\nAutenticação realizada com sucesso!")
-        print("Hostname:", resultado["mainframe"]["hostname"])
+        print("Hostname:", res["mainframe"]["hostname"])
 
-        componentes = resultado["componentes\n"]
+        componentes = res["componentes"]
         authComponentes(componentes)
 
         escrita()
