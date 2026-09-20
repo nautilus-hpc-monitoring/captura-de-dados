@@ -1,7 +1,7 @@
-import cpu.cpu as cpu
-import ram.ram as ram
-import disco.disco as disco
-import swap.swap as swap
+import utils.cpu.cpu as cpu
+import utils.ram.ram as ram
+import utils.disco.disco as disco
+import utils.swap.swap as swap
 
 def titulo(texto: str):
     print("\n" + "=" * 65)

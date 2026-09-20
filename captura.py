@@ -1,12 +1,26 @@
+import requests
 import psutil as p
-import csv
-import time
 import os
-from datetime import datetime
+import time
+import csv
+import datetime
+import socket
+
+email = input('Email: ')
+password = input('Senha: ')
+host = socket.gethostname()
+url_auth = "http://localhost:3000/api/autenticacao"
+
+flags_monitoramento = {}
+dados = []
+
+def authComponentes(componentes):
+    for componente in componentes:
+        flags_monitoramento[componente['type']] = True
 
 cabecalho = [
     'TIMESTAMP',
-    'USUARIO',
+    'USER',
 
     'CPU_PERCENT',
     'CPU_USER_PERCENT',
@@ -70,62 +84,100 @@ cabecalho = [
     'DISCO_WRITE_MERGED_COUNT',
     'DISCO_BUSY_TIME'
 ]
-
 usuario = os.environ.get('USER')
 
-with open('./raphael.csv', 'w', newline='') as csvfile:
-    csv.writer(csvfile, delimiter=';').writerow(cabecalho)
 
-while True:
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+def escrita():
+    with open('./data.csv', 'w', newline='') as csvfile:
+        csv.writer(csvfile, delimiter=';').writerow(cabecalho)
 
-    cpu_percent = p.cpu_percent()
-    cpu_times = p.cpu_times_percent()
-    cpu_stats = p.cpu_stats()
-    cpu_freq = p.cpu_freq()
+    while True:
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-    load = p.getloadavg()
+        cpu_percent = p.cpu_percent()
+        cpu_times = p.cpu_times_percent()
+        cpu_stats = p.cpu_stats()
+        cpu_freq = p.cpu_freq()
 
-    ram = p.virtual_memory()
-    swap = p.swap_memory()
-    disco = p.disk_usage('/')
+        load = p.getloadavg()
 
-    dados = [
-        timestamp,
-        usuario,
+        ram = p.virtual_memory()
+        swap = p.swap_memory()
+        disco = p.disk_usage('/')
 
-        cpu_percent,
-        cpu_times.user,
-        cpu_times.system,
-        cpu_times.idle,
-        cpu_times.iowait,
+        dados = [
+            timestamp,
+            usuario,
 
-        cpu_stats.interrupts,
+            cpu_percent,
+            cpu_times.user,
+            cpu_times.system,
+            cpu_times.idle,
+            cpu_times.iowait,
 
-        cpu_freq.current,
+            cpu_stats.interrupts,
 
-        load[0],
-        load[1],
-        load[2],
+            cpu_freq.current,
 
-        ram.percent,
-        ram.total,
-        ram.available,
-        ram.used,
-        ram.free,
+            load[0],
+            load[1],
+            load[2],
 
-        swap.percent,
-        swap.used,
-        swap.free,
-        swap.sin,
-        swap.sout,
+            ram.percent,
+            ram.total,
+            ram.available,
+            ram.used,
+            ram.free,
 
-        disco.percent,
-        disco.used,
-        disco.free
+            swap.percent,
+            swap.used,
+            swap.free,
+            swap.sin,
+            swap.sout,
+
+            disco.percent,
+            disco.used,
+            disco.free
     ]
 
-    with open('./raphael.csv', 'a', newline='') as csvfile:
-        csv.writer(csvfile, delimiter=';').writerow(dados)
+        with open('./data.csv', 'a', newline='') as csvfile:
+            csv.writer(csvfile, delimiter=';').writerow(dados)
 
-    time.sleep(1)
+        time.sleep(10)
+
+try:
+    res = requests.post(
+        url_auth,
+        json={
+            "email": email,
+            "senha": password,
+            "hostname": host
+        }
+    )
+    res.raise_for_status()
+
+    resultado = res.json()
+    print(resultado)
+
+    if resultado.get("autenticado"):
+
+        print("Autenticação realizada com sucesso!")
+        print("Hostname:", resultado["mainframe"]["hostname"])
+
+        componentes = resultado["componentes"]
+
+        authComponentes(componentes)
+
+        #escrita()
+
+    else:
+        print("Falha na autenticação.")
+
+except requests.exceptions.HTTPError as erro:
+
+    print("Erro na autenticação:", erro)
+
+except requests.exceptions.RequestException as erro:
+
+    print("Não foi possível conectar à API:", erro)
+

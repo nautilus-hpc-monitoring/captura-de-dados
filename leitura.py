@@ -1,6 +1,6 @@
 import csv
 import utils.exibicao as ex
-import cpu.cpu as cpu
+import utils.cpu.cpu as cpu
 
 cabecalho = [
     'TIMESTAMP',
@@ -61,7 +61,7 @@ def ler_csv(nome_arquivo: str) -> list:
     return dados
 
 def main():
-    dados = ler_csv('raphael.csv')
+    dados = ler_csv('data.csv')
 
     if len(dados) == 0:
         print("Nenhum dado encontrado.")
