@@ -8,9 +8,14 @@ import socket
 import logging
 
 host = socket.gethostname()
-url_auth = 'http://localhost:3000/autenticacao'
+url_auth = 'http://localhost:3333/usuarios/autenticar'
 
-flags_monitoramento = {}
+flags_monitoramento = {
+    'CPU': True,
+    'RAM': True,
+    'SWAP': True,
+    'DISCO': True
+}
 
 def authComponentes(componentes):
     for componente in componentes:
@@ -21,17 +26,20 @@ def coletar_cpu():
         cpu_times = p.cpu_times_percent()
         cpu_freq = p.cpu_freq()
 
+        # O iowait só existe no Linux/macOS. No Windows, usamos 0 para evitar o erro.
+        iowait_val = getattr(cpu_times, 'iowait', 0)
+
         return [
             p.cpu_percent(),
             cpu_times.user,
             cpu_times.system,
             cpu_times.idle,
-            cpu_times.iowait,
-            cpu_freq.current,
+            iowait_val,
+            cpu_freq.current if cpu_freq else 0,
             p.cpu_count(),
-            p.getloadavg()[0],
-            p.getloadavg()[1],
-            p.getloadavg()[2]
+            p.getloadavg()[0] if hasattr(p, 'getloadavg') else 0,
+            p.getloadavg()[1] if hasattr(p, 'getloadavg') else 0,
+            p.getloadavg()[2] if hasattr(p, 'getloadavg') else 0
         ]
 
     return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
@@ -111,7 +119,7 @@ cabecalho = [
     'DISCO_USED',
     'DISCO_FREE'
 ]
-usuario = os.environ.get('USER')
+usuario = os.environ.get('USER') or os.environ.get('USERNAME') or 'Desconhecido'
 
 def upload_file(file_name, bucket, object_name):
     try:
@@ -203,8 +211,8 @@ if __name__ == '__main__':
         res = requests.post(
             url_auth,
             json={
-                'email': email,
-                'senha': password,
+                'emailServer': email,
+                'senhaServer': password,
                 'hostname': host
             }
         )
@@ -213,13 +221,9 @@ if __name__ == '__main__':
         res = res.json()
         print(res)
 
-        if res.get('autenticado'):
+        # Verifica se o login retornou o id_usuario (o que indica sucesso)
+        if res.get('id_usuario'):
             print('\nAutenticação realizada com sucesso!')
-            print(f'Node: {res['node']['hostname']}\n')
-
-            componentes = res['componentesnode']
-            authComponentes(componentes)
-
             escrita()
 
         else:
