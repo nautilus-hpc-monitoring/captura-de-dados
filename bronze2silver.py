@@ -104,10 +104,10 @@ def limpar(df):
             invalido = df[coluna] < 0
             df.loc[invalido, coluna] = np.nan
 
-    for grupo, lista in grupos_verificacao.items():
-        if all(col in df.columns for col in lista):
-            nao_monitorado = (df[lista] == 0).all(axis=1)
-            df.loc[nao_monitorado, lista] = np.nan
+    # for grupo, lista in grupos_verificacao.items():
+    #     if all(col in df.columns for col in lista):
+    #         nao_monitorado = (df[lista] == 0).all(axis=1)
+    #         df.loc[nao_monitorado, lista] = np.nan
  
     df = df.dropna(subset=[c for c in colunas_numericas if c in df.columns], how='all')
     df.dropna(subset=['TIMESTAMP'], inplace=True)
