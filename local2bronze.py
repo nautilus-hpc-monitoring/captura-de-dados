@@ -8,7 +8,7 @@ import socket
 import logging
 
 host = socket.gethostname()
-url_auth = 'http://localhost:3333/usuarios/autenticar'
+url_auth = 'http://localhost:3000/auth/'
 
 flags_monitoramento = {
     'CPU': True,
@@ -211,8 +211,8 @@ if __name__ == '__main__':
         res = requests.post(
             url_auth,
             json={
-                'emailServer': email,
-                'senhaServer': password,
+                'email': email,
+                'senha': password,
                 'hostname': host
             }
         )
@@ -221,8 +221,7 @@ if __name__ == '__main__':
         res = res.json()
         print(res)
 
-        # Verifica se o login retornou o id_usuario (o que indica sucesso)
-        if res.get('id_usuario'):
+        if res.get('autenticado'):
             print('\nAutenticação realizada com sucesso!')
             escrita()
 

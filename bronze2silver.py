@@ -157,6 +157,6 @@ if __name__ == '__main__':
         print(f"Erro durante a execução da ETL: {e}")
 
     finally:
-        shutil.rmtree('raw_local', ignore_errors=True)
-        shutil.rmtree('silver_local', ignore_errors=True)
+        # shutil.rmtree('raw_local', ignore_errors=True)
+        # shutil.rmtree('silver_local', ignore_errors=True)
         print('Arquivos locais temporários removidos!')
