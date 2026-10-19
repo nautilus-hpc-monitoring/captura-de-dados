@@ -42,7 +42,7 @@ def coletar_cpu():
             p.getloadavg()[2] if hasattr(p, 'getloadavg') else 0
         ]
 
-    return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    return [None, None, None, None, None, None, None, None, None, None]
 
 
 def coletar_ram():
@@ -56,7 +56,7 @@ def coletar_ram():
             ram.used
         ]
 
-    return [0, 0, 0, 0]
+    return [None, None, None, None]
 
 
 def coletar_swap():
@@ -71,7 +71,7 @@ def coletar_swap():
             swap.sout
         ]
 
-    return [0, 0, 0, 0, 0]
+    return [None, None, None, None, None]
 
 
 def coletar_disco():
@@ -85,7 +85,7 @@ def coletar_disco():
             disco.free
         ]
 
-    return [0, 0, 0, 0]
+    return [None, None, None, None]
 
 cabecalho = [
     'TIMESTAMP',
