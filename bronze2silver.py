@@ -78,14 +78,7 @@ def limpar(df):
     colunas_sem_negativos = ['CPU_FREQ_ATUAL', 'CPU_COUNT_LOGICA', 'LOAD_AVG_1', 'LOAD_AVG_5', 'LOAD_AVG_15']
     colunas_percentual = ['CPU_PERCENT', 'CPU_USER_PERCENT', 'CPU_SYSTEM_PERCENT', 'CPU_IDLE_PERCENT', 'CPU_IOWAIT_PERCENT', 'RAM_PERCENT', 'SWAP_PERCENT', 'DISCO_PERCENT']
     colunas_bytes = ['RAM_TOTAL', 'RAM_AVAILABLE', 'RAM_USED', 'SWAP_USED', 'SWAP_FREE', 'SWAP_IN', 'SWAP_OUT', 'DISCO_TOTAL', 'DISCO_USED', 'DISCO_FREE']
-
-    grupos_verificacao = {
-        'CPU': ['CPU_PERCENT', 'CPU_USER_PERCENT', 'CPU_SYSTEM_PERCENT', 'CPU_IDLE_PERCENT', 'CPU_IOWAIT_PERCENT', 'CPU_FREQ_ATUAL', 'CPU_COUNT_LOGICA', 'LOAD_AVG_1', 'LOAD_AVG_5', 'LOAD_AVG_15'],
-        'RAM': ['RAM_PERCENT','RAM_TOTAL','RAM_AVAILABLE','RAM_USED'],
-        'SWAP': ['SWAP_PERCENT','SWAP_USED','SWAP_FREE','SWAP_IN','SWAP_OUT'],
-        'DISCO': ['DISCO_PERCENT','DISCO_TOTAL','DISCO_USED','DISCO_FREE']
-    }
-
+    
     df = df.copy()
 
     df['TIMESTAMP'] = pd.to_datetime(df['TIMESTAMP'], errors='coerce')
@@ -103,11 +96,6 @@ def limpar(df):
         if coluna in df.columns:
             invalido = df[coluna] < 0
             df.loc[invalido, coluna] = np.nan
-
-    # for grupo, lista in grupos_verificacao.items():
-    #     if all(col in df.columns for col in lista):
-    #         nao_monitorado = (df[lista] == 0).all(axis=1)
-    #         df.loc[nao_monitorado, lista] = np.nan
  
     df = df.dropna(subset=[c for c in colunas_numericas if c in df.columns], how='all')
     df.dropna(subset=['TIMESTAMP'], inplace=True)
@@ -145,18 +133,18 @@ def processar(chave_origem):
 if __name__ == '__main__':
     try:
         chaves_pendentes = listar_pendentes()
-        print(f"Arquivos encontrados na Bronze para processar: {len(chaves_pendentes)}")
+        print(f"Arquivos encontrados na bronze para processar: {len(chaves_pendentes)}")
 
         for chave_atual in chaves_pendentes:
-            print(f"Processando e enviando para Silver: {chave_atual}")
+            print(f"Processando e enviando para silver: {chave_atual}")
             processar(chave_atual)
 
-        print('ETL Bronze -> Silver concluída com sucesso! :)')
+        print('ETL bronze -> silver concluída com sucesso! :)')
 
     except Exception as e:
         print(f"Erro durante a execução da ETL: {e}")
 
-    finally:
-        # shutil.rmtree('raw_local', ignore_errors=True)
-        # shutil.rmtree('silver_local', ignore_errors=True)
-        print('Arquivos locais temporários removidos!')
+    # finally:
+    #     shutil.rmtree('raw_local', ignore_errors=True)
+    #     shutil.rmtree('silver_local', ignore_errors=True)
+    #     print('Arquivos locais temporários removidos!')
