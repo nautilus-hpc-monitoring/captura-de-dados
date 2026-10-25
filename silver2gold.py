@@ -58,28 +58,6 @@ def processar_camada_gold():
     ultimas_24h = agora - timedelta(hours=24)
     ultimos_30_dias = agora - timedelta(days=30)
 
-    #KPIS
-    df_24h = df_global[df_global['TIMESTAMP'] >= ultimas_24h]
-    
-    # Consideramos critico se CPU ou DISCO > 90%, aviso se > 75%
-    def classificar_alerta(row):
-        cpu = row.get('CPU_PERCENT', 0)
-        disco = row.get('DISCO_PERCENT', 0)
-        if cpu > 90 or disco > 90:
-            return 'critico'
-        elif cpu > 75 or disco > 75:
-            return 'aviso'
-        return 'ok'
-
-    if not df_24h.empty:
-        df_24h['STATUS_ALERTA'] = df_24h.apply(classificar_alerta, axis=1)
-        kpi_alertas = df_24h[df_24h['STATUS_ALERTA'] != 'ok']
-        total_critico = len(kpi_alertas[kpi_alertas['STATUS_ALERTA'] == 'critico'])
-        total_aviso = len(kpi_alertas[kpi_alertas['STATUS_ALERTA'] == 'aviso'])
-    else:
-        total_critico = 0
-        total_aviso = 0
-
     # GRÁFICO 1: Incidentes por Node (Últimos 30 dias)
     df_30d = df_global[df_global['TIMESTAMP'] >= ultimos_30_dias]
     if not df_30d.empty:
