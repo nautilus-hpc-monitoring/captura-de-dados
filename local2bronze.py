@@ -6,9 +6,66 @@ import csv
 from datetime import datetime
 import socket
 import logging
+from getpass import getpass
+from datetime import timezone
+from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError
+from boto3.exceptions import S3UploadFailedError
 
 host = socket.gethostname()
-url_auth = 'http://localhost:3000/auth/'
+url_auth = os.getenv('AUTH_URL', 'http://localhost:3000/auth/').rstrip('/')
+url_credenciais = url_auth + '/credenciais'
+credenciais_login = None
+
+def renovar_credenciais():
+    global s3_client
+    if not credenciais_login:
+        return False
+    try:
+        resposta = requests.post(url_credenciais, json=credenciais_login,
+                                 timeout=(5, 15), allow_redirects=False)
+        if resposta.status_code != 200:
+            logging.warning('Endpoint de credenciais indisponivel (HTTP %s).', resposta.status_code)
+            return False
+        payload = resposta.json()
+
+        cred = payload['credenciais']
+
+        campos = ('accessKeyId', 'secretAccessKey', 'sessionToken')
+
+        if not all(isinstance(cred.get(k), str) and cred[k] for k in campos):
+            return False
+
+        expiracao = datetime.fromisoformat(cred['expiration'].replace('Z', '+00:00'))
+        
+        if expiracao.tzinfo is None or (expiracao - datetime.now(timezone.utc)).total_seconds() <= 60:
+            return False
+
+        novo_cliente = boto.client(
+            's3', aws_access_key_id=cred['accessKeyId'],
+            aws_secret_access_key=cred['secretAccessKey'],
+            aws_session_token=cred['sessionToken'],
+            region_name=payload.get('region') or os.getenv('REGION_NAME') or 'us-east-1')
+
+        s3_client = novo_cliente
+        return True
+
+    except (requests.exceptions.RequestException, ValueError, KeyError, TypeError, AttributeError):
+        logging.warning('Nao foi possivel renovar as credenciais; o lote permanece pendente.')
+        return False
+
+
+def erro_de_acesso(erro):
+    codigos = {'ExpiredToken', 'ExpiredTokenException', 'InvalidToken',
+               'InvalidAccessKeyId', 'SignatureDoesNotMatch', 'RequestExpired',
+               'AccessDenied', 'TokenRefreshRequired'}
+    if isinstance(erro, (NoCredentialsError, PartialCredentialsError)):
+        return True
+    if isinstance(erro, ClientError):
+        return erro.response.get('Error', {}).get('Code') in codigos
+    # upload_file encapsula ClientError em S3UploadFailedError.
+    return isinstance(erro, S3UploadFailedError) and any(
+        '(' + codigo + ')' in str(erro) for codigo in codigos)
+
 
 flags_monitoramento = {
     'CPU': True,
@@ -123,13 +180,21 @@ usuario = os.environ.get('USER') or os.environ.get('USERNAME') or 'Desconhecido'
 
 def upload_file(file_name, bucket, object_name):
     try:
-        response = s3_client.upload_file(file_name, bucket, object_name) 
-    except Exception as e:
-       logging.error(e)
+        s3_client.upload_file(file_name, bucket, object_name)
+        return True
+    except Exception as erro:
+        if not erro_de_acesso(erro):
+            logging.warning('Falha no upload; lote pendente (%s).', type(erro).__name__)
+            return False
 
-       return False
-    
-    return True
+    if not renovar_credenciais():
+        return False
+    try:
+        s3_client.upload_file(file_name, bucket, object_name)
+        return True
+    except Exception as erro:
+        logging.warning('Envio ainda indisponivel apos renovacao (%s).', type(erro).__name__)
+        return False
 
 INTERVALO = 10  
 LOTE = 6 
@@ -141,7 +206,7 @@ def enviar_lote(linhas):
 
 
     objeto = (
-        f'{os.getenv('FILE_KEY')}/'
+        f"{os.getenv('FILE_KEY')}/"
         f'hostname={host}/ano={momento:%Y}/mes={momento:%m}/dia={momento:%d}/'
         f'{nome_caminho}'
     )
@@ -205,7 +270,8 @@ if __name__ == '__main__':
     print(start_msg)
 
     email = input('Email: ')
-    password = input('Senha: ')
+    password = getpass('Senha: ')
+    credenciais_login = {'email': email, 'senha': password, 'hostname': host}
 
     try:
         res = requests.post(
@@ -219,7 +285,7 @@ if __name__ == '__main__':
         res.raise_for_status()
 
         res = res.json()
-        print(res)
+
 
         if res.get('autenticado'):
             print('\nAutenticação realizada com sucesso!')
@@ -230,7 +296,7 @@ if __name__ == '__main__':
 
     except requests.exceptions.HTTPError as erro:
         print('Erro na autenticação:', erro)
-        print('Resposta do servidor:', erro.response.text)
+
 
     except requests.exceptions.RequestException as erro:
         print('Não foi possível conectar à API:', erro)
