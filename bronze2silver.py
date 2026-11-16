@@ -130,6 +130,28 @@ def processar(chave_origem):
 
     return upload_file(file_silver, os.getenv('BUCKET_NAME'), chave_destino)
 
+
+
+# Entrada Lambda: reaproveita as funções originais, sem mudar a limpeza ou os uploads.
+def lambda_handler(event, context):
+    import tempfile
+
+    diretorio_anterior = os.getcwd()
+    diretorio_temporario = "/tmp" if os.getenv("AWS_LAMBDA_FUNCTION_NAME") else None
+    with tempfile.TemporaryDirectory(dir=diretorio_temporario) as pasta:
+        try:
+            # A Lambda permite escrever em /tmp. Os caminhos relativos originais funcionam aqui.
+            os.chdir(pasta)
+            pendentes = listar_pendentes()
+            for chave in pendentes:
+                enviado = processar(chave)
+                if not enviado:
+                    raise RuntimeError(f"Falha ao publicar na Silver: {chave}")
+            return {"processados": len(pendentes)}
+        finally:
+            os.chdir(diretorio_anterior)
+
+
 if __name__ == '__main__':
     try:
         chaves_pendentes = listar_pendentes()

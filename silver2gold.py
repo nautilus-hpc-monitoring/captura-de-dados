@@ -1,1024 +1,327 @@
-# ETL Silver -> Gold: gestor, analista e operador.
+"""ETL do gestor: lê CSVs da Silver e publica o JSON da dashboard na Gold.
 
+MAPA DO ARQUIVO
+1. Configuração e nodes: variáveis de ambiente ou cadastro do banco.
+2. Leitura da Silver: validação, filtro de datas e remoção de duplicatas.
+3. Publicação JSON e reutilização das previsões do período.
+4. Gráfico 1: ocupação de disco real e prevista.
+5. Gráfico 2: mapa de calor de CPU e RAM.
+6. Gráfico 3: consumo real e referência das duas semanas anteriores.
+7. Gráfico 5: leituras de RAM e contadores de swap disponíveis.
+8. KPI: médias dos componentes desde segunda-feira.
+9. Execução e entrada da Lambda.
 
-# ======================================================================
-# SECAO GESTOR — origem: silver2gold.py
-# ======================================================================
-
+A captura continua em local2bronze.py; não é feita por esta ETL.
+Alertas, SLA e gráfico 4 são calculados pelo site usando o MySQL.
+Local: python silver2gold.py. Lambda: silver2gold.lambda_handler.
+"""
 import io
-import os
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-from config_aws import *
-
-import shutil
-
-PREFIXO_ORIGEM_GESTOR = '02-silver/'
-PREFIXO_DESTINO_GESTOR = '03-gold/'
-
-def listar_chaves_gestor(prefixo):
-    paginator = s3_client.get_paginator('list_objects_v2')
-    params = {
-        'Bucket': os.getenv('BUCKET_NAME'),
-        'Prefix': prefixo
-    }
-    page_iterator = paginator.paginate(**params)
-    chaves = []
-    for pagina in page_iterator:
-        for obj in pagina.get('Contents', []):
-            chave = obj['Key']
-            if chave.endswith('.csv'):
-                chaves.append(chave)
-    return chaves
-
-def baixar_arquivo(chave_origem):
-    caminho_local = os.path.join('silver_local', os.path.basename(chave_origem))
-    os.makedirs(os.path.dirname(caminho_local), exist_ok=True)
-    s3_client.download_file(os.getenv('BUCKET_NAME'), chave_origem, caminho_local)
-    return caminho_local
-
-def processar_camada_gold_gestor():
-    chaves_silver = listar_chaves_gestor(PREFIXO_ORIGEM_GESTOR)
-    if not chaves_silver:
-        print("Nenhum arquivo encontrado na camada Silver para processar.")
-        return
-
-    dfs = []
-    for chave in chaves_silver:
-        caminho = baixar_arquivo(chave)
-        df_temp = pd.read_csv(caminho, sep=';')
-        dfs.append(df_temp)
-
-
-    # ==========================================
-    # GESTOR
-    # ==========================================
-
-
-    # Consolida todos os dados da Silver em um único DataFrame global para análise do Gestor
-    df_global = pd.concat(dfs, ignore_index=True)
-    df_global['TIMESTAMP'] = pd.to_datetime(df_global['TIMESTAMP'], errors='coerce')
-    df_global.dropna(subset=['TIMESTAMP'], inplace=True)
-
-    agora = datetime.now()
-    ultimas_24h = agora - timedelta(hours=24)
-    ultimos_30_dias = agora - timedelta(days=30)
-
-    # Totais das ultimas 24h, usando a classificacao compartilhada abaixo.
-    status_24h = df_global.loc[df_global['TIMESTAMP'] >= ultimas_24h].apply(classificar_alerta, axis=1)
-    total_critico = int((status_24h == 'critico').sum())
-    total_aviso = int((status_24h == 'aviso').sum())
-
-    # GRÁFICO 1: Incidentes por Node (Últimos 30 dias)
-    df_30d = df_global[df_global['TIMESTAMP'] >= ultimos_30_dias]
-    if not df_30d.empty:
-        df_30d['STATUS_INCIDENTE'] = df_30d.apply(classificar_alerta, axis=1)
-        df_incidentes = df_30d[df_30d['STATUS_INCIDENTE'] != 'ok']
-        grafico_historico = df_incidentes.groupby('HOSTNAME').size().reset_index(name='total_incidentes')
-        grafico_historico = grafico_historico.sort_values(by='total_incidentes', ascending=False).head(10)
-    else:
-        grafico_historico = pd.DataFrame(columns=['HOSTNAME', 'total_incidentes'])
-
-    # GRÁFICO 2: Projeção de Piora (Janelas de 30 dias)
-    # Dividindo os últimos 90 dias em janelas de 30 dias para regressão linear
-    janela_1 = df_global[(df_global['TIMESTAMP'] >= agora - timedelta(days=90)) & (df_global['TIMESTAMP'] < agora - timedelta(days=60))]
-    janela_2 = df_global[(df_global['TIMESTAMP'] >= agora - timedelta(days=60)) & (df_global['TIMESTAMP'] < agora - timedelta(days=30))]
-    janela_3 = df_global[df_global['TIMESTAMP'] >= agora - timedelta(days=30)]
-
-    def contar_por_node(df):
-        if df.empty:
-            return pd.Series(dtype=int)
-        df['inc'] = df.apply(classificar_alerta, axis=1) != 'ok'
-        return df[df['inc']].groupby('HOSTNAME').size()
-
-    j1 = contar_por_node(janela_1)
-    j2 = contar_por_node(janela_2)
-    j3 = contar_por_node(janela_3)
-
-    nodes_unicos = set(list(j1.index) + list(j2.index) + list(j3.index))
-    projecoes = []
-
-    for node in nodes_unicos:
-        v1 = j1.get(node, 0)
-        v2 = j2.get(node, 0)
-        v3 = j3.get(node, 0)
-        janelas_y = [v1, v2, v3]
-        
-        # Regressão linear simples para previsão dos próximos 30 dias
-        n = len(janelas_y)
-        xm = (n - 1) / 2
-        ym = sum(janelas_y) / n
-        num = sum((i - xm) * (v - ym) for i, v in enumerate(janelas_y))
-        den = sum((i - xm) ** 2 for i in range(n))
-        
-        a = (num / den) if den != 0 else 0
-        b = ym - a * xm
-        previsto = max(0, a * n + b)
-        variacao = previsto - v3
-
-        projecoes.append({
-            'nome': node,
-            'janela_antiga_1': v1,
-            'janela_antiga_2': v2,
-            'ultimos30': v3,
-            'previsto': round(previsto, 1),
-            'variacao': round(variacao, 1)
-        })
-
-
-    df_projecoes = pd.DataFrame(projecoes)
-    if not df_projecoes.empty:
-        df_projecoes = df_projecoes.sort_values(by='variacao', ascending=False)
-
-    # ==========================================
-    # Gravando os arquivos consolidados na Gold
-    # ==========================================
-    os.makedirs('gold_local', exist_ok=True)
-    
-    path_kpis = 'gold_local/kpis_resumo.csv'
-    path_hist = 'gold_local/grafico_historico.csv'
-    path_proj = 'gold_local/grafico_projecao.csv'
-
-    # DataFrame de KPIs resumidos
-    df_kpis = pd.DataFrame([{
-        'total_alertas_24h': total_critico + total_aviso,
-        'alertas_aviso': total_aviso,
-        'alertas_critico': total_critico,
-        'atualizado_em': agora.strftime('%Y-%m-%d %H:%M:%S')
-    }])
-
-    df_kpis.to_csv(path_kpis, sep=';', index=False)
-    grafico_historico.to_csv(path_hist, sep=';', index=False)
-    df_projecoes.to_csv(path_proj, sep=';', index=False)
-
-    # Upload para o S3 (Camada Gold)
-    momento_str = agora.strftime('%Y%m%d_%H%M%S')
-    upload_file(path_kpis, os.getenv('BUCKET_NAME'), f'{PREFIXO_DESTINO_GESTOR}kpis/kpis_{momento_str}.csv')
-    upload_file(path_hist, os.getenv('BUCKET_NAME'), f'{PREFIXO_DESTINO_GESTOR}historico/historico_{momento_str}.csv')
-    upload_file(path_proj, os.getenv('BUCKET_NAME'), f'{PREFIXO_DESTINO_GESTOR}projecao/projecao_{momento_str}.csv')
-
-    print("ETL Silver -> Gold executada com sucesso!")
-
-
-# ======================================================================
-# SECAO ANALISTA — origem: silver2goldAnalista.py
-# ======================================================================
-
-
-import os
 import json
-from datetime import datetime, timezone
-
-import pandas as pd
-import numpy as np
-
-from config_aws import s3_client
-
-
-# =========================================================
-# CONFIGURACOES
-# =========================================================
-
-PREFIXO_ORIGEM_ANALISTA = "02-silver/"
-PREFIXO_DESTINO_ANALISTA = "03-gold/analista/"
-
-LIMITE_ANOMALIA = 80
-LIMITE_VARIACAO = 20
-
-COMPONENTES = {
-    "CPU": "CPU_PERCENT",
-    "RAM": "RAM_PERCENT",
-    "DISCO": "DISCO_PERCENT"
-}
-
-COLUNAS_OBRIGATORIAS = [
-    "TIMESTAMP",
-    "HOSTNAME",
-    "CPU_PERCENT",
-    "RAM_PERCENT",
-    "DISCO_PERCENT"
-]
-
-
-# =========================================================
-# 1. LEITURA DOS DADOS DA SILVER
-# =========================================================
-
-def listar_chaves_analista(prefixo):
-    """Lista os arquivos CSV existentes em um prefixo do S3."""
-
-    bucket = os.getenv("BUCKET_NAME")
-
-    if not bucket:
-        raise ValueError("A variável BUCKET_NAME não foi configurada.")
-
-    paginator = s3_client.get_paginator("list_objects_v2")
-
-    chaves = []
-
-    for pagina in paginator.paginate(
-        Bucket=bucket,
-        Prefix=prefixo
-    ):
-        for objeto in pagina.get("Contents", []):
-            chave = objeto["Key"]
-
-            if chave.lower().endswith(".csv"):
-                chaves.append(chave)
-
-    return chaves
-
-
-def carregar_dados_silver_analista():
-    """Baixa os CSVs da Silver diretamente para a memória."""
-
-    bucket = os.getenv("BUCKET_NAME")
-    chaves = listar_chaves_analista(PREFIXO_ORIGEM_ANALISTA)
-
-    if not chaves:
-        raise ValueError(
-            f"Nenhum CSV encontrado em {PREFIXO_ORIGEM_ANALISTA}"
-        )
-
-    dataframes = []
-
-    for chave in chaves:
-        resposta = s3_client.get_object(
-            Bucket=bucket,
-            Key=chave
-        )
-
-        df_temp = pd.read_csv(
-            resposta["Body"],
-            sep=";"
-        )
-
-        dataframes.append(df_temp)
-
-        print(f"Arquivo lido: {chave}")
-
-    df = pd.concat(dataframes, ignore_index=True)
-
-    # Confere se as colunas utilizadas existem.
-    faltantes = [
-        coluna
-        for coluna in COLUNAS_OBRIGATORIAS
-        if coluna not in df.columns
-    ]
-
-    if faltantes:
-        raise ValueError(
-            f"Colunas ausentes nos CSVs: {faltantes}"
-        )
-
-    df["TIMESTAMP"] = pd.to_datetime(
-        df["TIMESTAMP"],
-        errors="coerce"
-    )
-
-    for coluna in COMPONENTES.values():
-        df[coluna] = pd.to_numeric(
-            df[coluna],
-            errors="coerce"
-        )
-
-        # Percentuais válidos devem estar entre 0 e 100.
-        df.loc[
-            ~df[coluna].between(0, 100),
-            coluna
-        ] = np.nan
-
-    df["HOSTNAME"] = df["HOSTNAME"].astype("string")
-
-    df = df.dropna(
-        subset=["TIMESTAMP", "HOSTNAME"]
-    )
-
-    df = df.drop_duplicates(
-        subset=["HOSTNAME", "TIMESTAMP"],
-        keep="first"
-    )
-
-    return df.sort_values("TIMESTAMP").reset_index(drop=True)
-
-
-# =========================================================
-# 2. MEDIAS SEMANAIS E MENSAIS
-# =========================================================
-
-def calcular_medias_periodicas(df):
-    """Calcula as médias de CPU, RAM e disco por semana e mês."""
-
-    resultado = {
-        "semanal": [],
-        "mensal": []
-    }
-
-    for nome_periodo, frequencia in [
-        ("semanal", "W"),
-        ("mensal", "MS")
-    ]:
-        agrupado = (
-            df.set_index("TIMESTAMP")
-            .groupby("HOSTNAME")
-        )
-
-        for hostname, dados_host in agrupado:
-            medias = (
-                dados_host[list(COMPONENTES.values())]
-                .resample(frequencia)
-                .mean()
-                .dropna(how="all")
-            )
-
-            for timestamp, linha in medias.iterrows():
-                resultado[nome_periodo].append({
-                    "hostname": str(hostname),
-                    "periodo_inicio": timestamp.isoformat(),
-                    "medias": {
-                        componente: (
-                            round(float(linha[coluna]), 2)
-                            if pd.notna(linha[coluna])
-                            else None
-                        )
-                        for componente, coluna
-                        in COMPONENTES.items()
-                    }
-                })
-
-    return resultado
-
-
-# =========================================================
-# 3. COMPARACAO ENTRE PERIODOS
-# =========================================================
-
-def calcular_comparacao(df, dias):
-    """
-    Compara os últimos N dias disponíveis com os N dias anteriores.
-    A referência é o timestamp mais recente dos dados.
-    """
-
-    fim_atual = df["TIMESTAMP"].max()
-    inicio_atual = fim_atual - pd.Timedelta(days=dias)
-  
-    inicio_anterior = (
-        inicio_atual - pd.Timedelta(days=dias)
-    )
-
-    periodo_atual = df[
-        (df["TIMESTAMP"] > inicio_atual)
-        & (df["TIMESTAMP"] <= fim_atual)
-    ]
-
-    periodo_anterior = df[
-        (df["TIMESTAMP"] > inicio_anterior)
-        & (df["TIMESTAMP"] <= inicio_atual)
-    ]
-
-    comparacao = {}
-
-    for componente, coluna in COMPONENTES.items():
-        media_atual = periodo_atual[coluna].mean()
-        media_anterior = periodo_anterior[coluna].mean()
-
-        if pd.isna(media_atual):
-            variacao = None
-        elif pd.isna(media_anterior):
-            variacao = None
-        elif media_anterior == 0:
-            variacao = (
-                0.0 if media_atual == 0 else None
-            )
-        else:
-            variacao = (
-                (media_atual - media_anterior)
-                / abs(media_anterior)
-            ) * 100
-
-        comparacao[componente] = {
-            "media_atual": (
-                round(float(media_atual), 2)
-                if pd.notna(media_atual)
-                else None
-            ),
-            "media_anterior": (
-                round(float(media_anterior), 2)
-                if pd.notna(media_anterior)
-                else None
-            ),
-            "variacao_percentual": (
-                round(float(variacao), 2)
-                if variacao is not None
-                else None
-            ),
-            "ultrapassou_limite_variacao": (
-                abs(variacao) > LIMITE_VARIACAO
-                if variacao is not None
-                else None
-            )
-        }
-
-    return {
-        "dias_por_periodo": dias,
-        "periodo_atual": {
-            "inicio": inicio_atual.isoformat(),
-            "fim": fim_atual.isoformat()
-        },
-        "periodo_anterior": {
-            "inicio": inicio_anterior.isoformat(),
-            "fim": inicio_atual.isoformat()
-        },
-        "componentes": comparacao
-    }
-
-
-# =========================================================
-# 4. PICOS E PERCENTIS
-# =========================================================
-
-def calcular_estatisticas(df):
-    """Calcula pico, data do pico e percentis de cada componente."""
-
-    resultado = {}
-
-    for componente, coluna in COMPONENTES.items():
-        dados_validos = df.dropna(subset=[coluna])
-
-        if dados_validos.empty:
-            resultado[componente] = None
-            continue
-
-        indice_pico = dados_validos[coluna].idxmax()
-        pico = dados_validos.loc[indice_pico]
-
-        valores = dados_validos[coluna]
-
-        resultado[componente] = {
-            "pico": {
-                "valor": round(float(pico[coluna]), 2),
-                "timestamp": pico["TIMESTAMP"].isoformat(),
-                "hostname": str(pico["HOSTNAME"])
-            },
-            "percentis": {
-                "P50": round(float(valores.quantile(0.50)), 2),
-                "P90": round(float(valores.quantile(0.90)), 2),
-                "P95": round(float(valores.quantile(0.95)), 2),
-                "P99": round(float(valores.quantile(0.99)), 2)
-            },
-            "media_geral": round(float(valores.mean()), 2),
-            "minimo": round(float(valores.min()), 2),
-            "maximo": round(float(valores.max()), 2)
-        }
-
-    return resultado
-
-
-# =========================================================
-# 5. ANOMALIAS E DURACAO DOS EVENTOS
-# =========================================================
-
-def detectar_anomalias(df):
-    """
-    Considera anomalia cada leitura acima de 80%.
-
-    Agrupa leituras próximas do mesmo host e componente
-    em eventos. Uma lacuna superior a 30 segundos separa
-    eventos diferentes.
-    """
-
-    leituras = []
-
-    for componente, coluna in COMPONENTES.items():
-        anormais = df[df[coluna] > LIMITE_ANOMALIA]
-
-        for _, linha in anormais.iterrows():
-            leituras.append({
-                "hostname": str(linha["HOSTNAME"]),
-                "componente": componente,
-                "timestamp": linha["TIMESTAMP"],
-                "valor": float(linha[coluna])
-            })
-
-    if not leituras:
-        return {
-            "limite_percentual": LIMITE_ANOMALIA,
-            "quantidade_leituras_anomalas": 0,
-            "quantidade_eventos": 0,
-            "duracao_total_segundos": 0,
-            "eventos": []
-        }
-
-    anomalias = pd.DataFrame(leituras)
-    anomalias = anomalias.sort_values("timestamp")
-
-    eventos = []
-
-    for (hostname, componente), grupo in anomalias.groupby(
-        ["hostname", "componente"]
-    ):
-        grupo = grupo.sort_values("timestamp")
-
-        evento_atual = []
-
-        for _, leitura in grupo.iterrows():
-            if evento_atual:
-                diferenca = (
-                    leitura["timestamp"]
-                    - evento_atual[-1]["timestamp"]
-                ).total_seconds()
-
-                if diferenca > 30:
-                    eventos.append(
-                        criar_evento(
-                            hostname,
-                            componente,
-                            evento_atual
-                        )
-                    )
-                    evento_atual = []
-
-            evento_atual.append(leitura)
-
-        if evento_atual:
-            eventos.append(
-                criar_evento(
-                    hostname,
-                    componente,
-                    evento_atual
-                )
-            )
-
-    duracao_total = sum(
-        evento["duracao_segundos"]
-        for evento in eventos
-    )
-
-    return {
-        "limite_percentual": LIMITE_ANOMALIA,
-        "quantidade_leituras_anomalas": len(anomalias),
-        "quantidade_eventos": len(eventos),
-        "duracao_total_segundos": duracao_total,
-        "eventos": eventos
-    }
-
-
-def criar_evento(hostname, componente, leituras):
-    """Resume um conjunto de leituras anômalas em um evento."""
-
-    inicio = leituras[0]["timestamp"]
-    fim = leituras[-1]["timestamp"]
-
-    # A leitura final também conta como parte do evento.
-    # Para uma única leitura, a duração reportada é zero.
-    duracao = int((fim - inicio).total_seconds())
-
-    return {
-        "hostname": hostname,
-        "componente": componente,
-        "inicio": inicio.isoformat(),
-        "fim": fim.isoformat(),
-        "duracao_segundos": duracao,
-        "quantidade_leituras": len(leituras),
-        "valor_maximo": round(
-            max(leitura["valor"] for leitura in leituras),
-            2
-        )
-    }
-
-
-# =========================================================
-# 6. COMPONENTE MAIS INSTAVEL
-# =========================================================
-
-def calcular_componente_mais_instavel(df):
-    """
-    Mede a variação relativa entre o menor e o maior valor
-    observado em cada componente.
-
-    Variacao = (maximo - minimo) / minimo * 100.
-    Se o mínimo for zero, a variação relativa é indefinida.
-    """
-
-    resultado = {}
-
-    for componente, coluna in COMPONENTES.items():
-        valores = df[coluna].dropna()
-
-        if valores.empty:
-            resultado[componente] = None
-            continue
-
-        minimo = float(valores.min())
-        maximo = float(valores.max())
-
-        if minimo == 0:
-            variacao = None
-        else:
-            variacao = ((maximo - minimo) / abs(minimo)) * 100
-
-        resultado[componente] = {
-            "minimo": round(minimo, 2),
-            "maximo": round(maximo, 2),
-            "variacao_percentual": (
-                round(variacao, 2)
-                if variacao is not None
-                else None
-            ),
-            "ultrapassou_limite_variacao": (
-                variacao > LIMITE_VARIACAO
-                if variacao is not None
-                else None
-            )
-        }
-
-    candidatos = {
-        componente: dados["variacao_percentual"]
-        for componente, dados in resultado.items()
-        if dados is not None
-        and dados["variacao_percentual"] is not None
-    }
-
-    mais_instavel = (
-        max(candidatos, key=candidatos.get)
-        if candidatos
-        else None
-    )
-
-    return {
-        "limite_variacao_percentual": LIMITE_VARIACAO,
-        "componentes": resultado,
-        "componente_mais_instavel": mais_instavel
-    }
-
-
-# =========================================================
-# 7. GERACAO E ENVIO DO JSON PARA GOLD
-# =========================================================
-
-def processar_camada_gold_analista():
-    df = carregar_dados_silver_analista()
-
-    if df.empty:
-        raise ValueError("A Silver não contém dados válidos.")
-
-    print(f"Total de registros válidos: {len(df)}")
-
-    relatorio = {
-        "metadados": {
-            "gerado_em_utc": datetime.now(
-                timezone.utc
-            ).isoformat(),
-            "origem": PREFIXO_ORIGEM_ANALISTA,
-            "quantidade_registros": int(len(df)),
-            "primeira_leitura": df["TIMESTAMP"].min().isoformat(),
-            "ultima_leitura": df["TIMESTAMP"].max().isoformat()
-        },
-        "limites": {
-            "anomalia_percentual": LIMITE_ANOMALIA,
-            "variacao_percentual": LIMITE_VARIACAO
-        },
-        "medias_periodicas": calcular_medias_periodicas(df),
-        "comparacao_semanal": calcular_comparacao(df, 7),
-        "comparacao_mensal": calcular_comparacao(df, 30),
-        "estatisticas": calcular_estatisticas(df),
-        "anomalias": detectar_anomalias(df),
-        "instabilidade": calcular_componente_mais_instavel(df)
-    }
-
-    nome_arquivo = (
-        "analista_"
-        + datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        + ".json"
-    )
-
-    chave_destino = PREFIXO_DESTINO_ANALISTA + nome_arquivo
-
-    bucket = os.getenv("BUCKET_NAME")
-
-    if not bucket:
-        raise ValueError("A variável BUCKET_NAME não foi configurada.")
-
-    conteudo_json = json.dumps(
-        relatorio,
-        ensure_ascii=False,
-        indent=2,
-        allow_nan=False
-    ).encode("utf-8")
-
-    s3_client.put_object(
-        Bucket=bucket,
-        Key=chave_destino,
-        Body=conteudo_json,
-        ContentType="application/json; charset=utf-8"
-    )
-
-    print(f"JSON enviado para: {chave_destino}")
-
-    return relatorio
-
-
-
-# ======================================================================
-# SECAO OPERADOR — origem: silver2goldoperador.py
-# ======================================================================
-
+import math
 import os
-import re
-import json
-from datetime import datetime, timezone
-import pandas as pd
+from urllib.parse import quote
+
+import boto3
 import numpy as np
-from config_aws import s3_client
-
-
-# =========================================================
-# CONFIGURACOES
-# =========================================================
-
-PREFIXO_ORIGEM_OPERADOR = "02-silver/"
-PREFIXO_DESTINO_OPERADOR = "03-gold/operador/"
-
-JANELA_GRAFICO_MINUTOS = 5
-
-ARQUIVOS_POR_NODE = 8
-
-MINUTOS_SEM_DADOS = 5
-
-# Métrica exibida no dashboard -> coluna na camada Silver
-METRICAS = {
-    "CPU": "CPU_PERCENT",
-    "RAM": "RAM_PERCENT",
-    "DISCO": "DISCO_PERCENT",
-    "SWAP": "SWAP_PERCENT"
-}
-
-# Limites (%) por métrica: acima de "atencao" -> atenção; acima de "critico" -> crítico.
-LIMITES = {
-    metrica: {"atencao": 75, "critico": 90}
-    for metrica in METRICAS
-}
-
-ORDEM_STATUS = {"normal": 0, "atencao": 1, "critico": 2}
-
-
-# =========================================================
-# 1. LEITURA DOS DADOS RECENTES DA SILVER
-# =========================================================
-
-def listar_chaves_operador(prefixo):
-    bucket = os.getenv("BUCKET_NAME")
-
-    if not bucket:
-        raise ValueError("A variável BUCKET_NAME não foi configurada.")
-
-    paginator = s3_client.get_paginator("list_objects_v2")
-
-    chaves = []
-
-    for pagina in paginator.paginate(Bucket=bucket, Prefix=prefixo):
-        for objeto in pagina.get("Contents", []):
-            chave = objeto["Key"]
-
-            if chave.lower().endswith(".csv"):
-                chaves.append(chave)
-
-    return chaves
-
-
-def selecionar_chaves_recentes(chaves):
-    """
-    Mantém só os ARQUIVOS_POR_NODE arquivos mais recentes de cada node.
-    """
-
-    por_host = {}
-
-    for chave in chaves:
-        encontrado = re.search(r"hostname=([^/]+)/", chave)
-        host = encontrado.group(1) if encontrado else "desconhecido"
-        por_host.setdefault(host, []).append(chave)
-
-    selecionadas = []
-
-    for host, lista in por_host.items():
-        selecionadas.extend(sorted(lista)[-ARQUIVOS_POR_NODE:])
-
-    return selecionadas
-
-
-def carregar_dados_silver_operador():
-    """Baixa para a memória apenas os CSVs recentes de cada node."""
-
-    bucket = os.getenv("BUCKET_NAME")
-    chaves = selecionar_chaves_recentes(listar_chaves_operador(PREFIXO_ORIGEM_OPERADOR))
-
-    if not chaves:
-        raise ValueError(f"Nenhum CSV encontrado em {PREFIXO_ORIGEM_OPERADOR}")
-
-    dataframes = []
-
-    for chave in chaves:
-        resposta = s3_client.get_object(Bucket=bucket, Key=chave)
-        dataframes.append(pd.read_csv(resposta["Body"], sep=";"))
-
-    df = pd.concat(dataframes, ignore_index=True)
-
-    for coluna in ["TIMESTAMP", "HOSTNAME"]:
-        if coluna not in df.columns:
-            raise ValueError(f"Coluna obrigatória ausente nos CSVs: {coluna}")
-
-    for coluna in METRICAS.values():
-        if coluna not in df.columns:
-            df[coluna] = np.nan
-
-    df["TIMESTAMP"] = pd.to_datetime(df["TIMESTAMP"], errors="coerce")
-
-    for coluna in METRICAS.values():
-        df[coluna] = pd.to_numeric(df[coluna], errors="coerce")
-
-        df.loc[~df[coluna].between(0, 100), coluna] = np.nan
-
-    df["HOSTNAME"] = df["HOSTNAME"].astype("string")
-
-    df = df.dropna(subset=["TIMESTAMP", "HOSTNAME"])
-    df = df.drop_duplicates(subset=["HOSTNAME", "TIMESTAMP"], keep="first")
-
-    return df.sort_values(["HOSTNAME", "TIMESTAMP"]).reset_index(drop=True)
-
-
-# =========================================================
-# 2. KPIs E GRAFICOS DE CADA NODE
-# =========================================================
-
-def classificar_valor(metrica, valor):
-    """normal, atencao, critico ou sem_dados (quando não há leitura)."""
-
-    if valor is None or pd.isna(valor):
-        return "sem_dados"
-
-    limites = LIMITES[metrica]
-
-    if valor > limites["critico"]:
-        return "critico"
-
-    if valor > limites["atencao"]:
-        return "atencao"
-
-    return "normal"
-
-
-def numero(valor):
-    return None if pd.isna(valor) else round(float(valor), 1)
-
-
-def montar_node(hostname, dados_host, agora):
-    ultima_leitura = dados_host["TIMESTAMP"].max()
-    inicio_janela = ultima_leitura - pd.Timedelta(minutes=JANELA_GRAFICO_MINUTOS)
-
-    janela = dados_host[dados_host["TIMESTAMP"] > inicio_janela]
-
-    minutos_sem_coleta = round(
-        (agora - ultima_leitura).total_seconds() / 60,
-        1
-    )
-
-    kpis = {}
-    status_metricas = []
-
-    for metrica, coluna in METRICAS.items():
-        leituras = janela[coluna].dropna()
-
-        valor = numero(leituras.iloc[-1]) if not leituras.empty else None
-        status = classificar_valor(metrica, valor)
-
-        kpis[metrica] = {"valor": valor, "status": status}
-        status_metricas.append(status)
-
-    if minutos_sem_coleta > MINUTOS_SEM_DADOS:
-        status_node = "sem_dados"
-    else:
-        validos = [s for s in status_metricas if s in ORDEM_STATUS]
-        status_node = (
-            max(validos, key=ORDEM_STATUS.get) if validos else "sem_dados"
-        )
-
-    graficos = {
-        "inicio": inicio_janela.isoformat(),
-        "fim": ultima_leitura.isoformat(),
-        "labels": janela["TIMESTAMP"].dt.strftime("%H:%M:%S").tolist()
-    }
-
-    for metrica, coluna in METRICAS.items():
-        graficos[metrica] = [numero(v) for v in janela[coluna]]
-
-    return {
-        "hostname": str(hostname),
-        "ultima_coleta": ultima_leitura.isoformat(),
-        "minutos_sem_coleta": minutos_sem_coleta,
-        "status": status_node,
-        "kpis": kpis,
-        "graficos": graficos
-    }
-
-
-# =========================================================
-# 3. GERACAO E ENVIO DO JSON PARA GOLD
-# =========================================================
-
-def processar_camada_gold_operador():
-    df = carregar_dados_silver_operador()
-
-    if df.empty:
-        raise ValueError("A Silver não contém dados válidos.")
-
-    print(f"Total de registros lidos: {len(df)}")
-
-    agora = pd.Timestamp(datetime.now())
-
-    nodes = [
-        montar_node(hostname, dados_host, agora)
-        for hostname, dados_host in df.groupby("HOSTNAME")
-    ]
-
-    relatorio = {
-        "metadados": {
-            "gerado_em_utc": datetime.now(timezone.utc).isoformat(),
-            "origem": PREFIXO_ORIGEM_OPERADOR,
-            "quantidade_registros": int(len(df)),
-            "quantidade_nodes": len(nodes),
-            "janela_grafico_minutos": JANELA_GRAFICO_MINUTOS,
-            "minutos_sem_dados": MINUTOS_SEM_DADOS
-        },
-        "limites": LIMITES,
-        "nodes": nodes
-    }
-
-    bucket = os.getenv("BUCKET_NAME")
-
-    if not bucket:
-        raise ValueError("A variável BUCKET_NAME não foi configurada.")
-
-    nome_arquivo = (
-        "operador_"
-        + datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        + ".json"
-    )
-
-    chave_destino = PREFIXO_DESTINO_OPERADOR + nome_arquivo
-
-    conteudo_json = json.dumps(
-        relatorio,
-        ensure_ascii=False,
-        indent=2,
-        allow_nan=False
-    ).encode("utf-8")
-
-    s3_client.put_object(
-        Bucket=bucket,
-        Key=chave_destino,
-        Body=conteudo_json,
-        ContentType="application/json; charset=utf-8"
-    )
-
-    print(f"JSON enviado para: {chave_destino}")
-
-    return relatorio
-
-
-
-# ======================================================================
-# INTEGRACAO DAS TRES ROTINAS
-# ======================================================================
-
-def upload_file(file_name, bucket, object_name):
-    # Upload do gestor; propaga falhas para nao indicar sucesso indevidamente.
-    s3_client.upload_file(file_name, bucket, object_name)
-    return True
-
-
-def classificar_alerta(linha):
-    # Gestor: reutiliza os limites de atencao/critico da secao OPERADOR.
-    estados = [classificar_valor(metrica, linha.get(coluna))
-               for metrica, coluna in METRICAS.items()]
-    if 'critico' in estados:
-        return 'critico'
-    if 'atencao' in estados:
-        return 'aviso'
-    return 'ok'
-
-
-def processar_camada_gold():
-    """Executa gestor, analista e operador em sequencia."""
+import pandas as pd
+from botocore.exceptions import ClientError
+from dotenv import load_dotenv
+
+load_dotenv()
+FUSO = "America/Sao_Paulo"
+ORIGEM = os.getenv("GESTOR_FUSO_ORIGEM", FUSO)
+SILVER = os.getenv("SILVER_PREFIX", "02-silver/")
+GOLD = os.getenv("CLUSTER_GOLD_PREFIX", "03-gold/gestor").rstrip("/")
+PASSO = int(os.getenv("COLETA_SEGUNDOS", "10"))
+COBERTURA = float(os.getenv("COBERTURA_MINIMA", "0.8"))
+COLUNAS = ["CPU_PERCENT", "RAM_PERCENT", "RAM_TOTAL", "RAM_AVAILABLE",
+           "SWAP_PERCENT", "SWAP_USED", "SWAP_FREE", "SWAP_IN", "SWAP_OUT",
+           "DISCO_TOTAL", "DISCO_USED"]
+
+
+# 1. CADASTRO: nodes informados na configuração ou consultados no banco.
+def buscar_hosts(cluster_id):
+    # Na Lambda, HOSTNAMES evita uma conexão com o MySQL da EC2.
+    if os.getenv("HOSTNAMES"):
+        hosts = json.loads(os.environ["HOSTNAMES"])
+        if not isinstance(hosts, list) or not hosts or not all(
+                isinstance(host, str) and host.strip() for host in hosts):
+            raise ValueError("HOSTNAMES deve ser uma lista JSON com nomes de nodes.")
+        return sorted(set(hosts))
+
+    import pymysql  # Necessário somente no modo que consulta o cadastro no banco.
+    conexao = pymysql.connect(
+        host=os.environ["DB_HOST"], port=int(os.getenv("DB_PORT", "3306")),
+        user=os.environ["DB_USER"], password=os.environ["DB_PASSWORD"],
+        database=os.environ["DB_DATABASE"], charset="utf8mb4")
     try:
-        processar_camada_gold_gestor()
-        analista = processar_camada_gold_analista()
-        operador = processar_camada_gold_operador()
-        return {'analista': analista, 'operador': operador}
+        with conexao.cursor() as cursor:
+            cursor.execute("SELECT hostname FROM node WHERE fk_cluster = %s ORDER BY hostname",
+                           (cluster_id,))
+            return [r[0] for r in cursor.fetchall()]
     finally:
-        shutil.rmtree('silver_local', ignore_errors=True)
-        shutil.rmtree('gold_local', ignore_errors=True)
+        conexao.close()
 
 
-if __name__ == '__main__':
-    processar_camada_gold()
+def instante(valor):
+    try:
+        t = pd.Timestamp(valor)
+        if pd.isna(t):
+            return pd.NaT
+        if t.tzinfo is None:
+            t = t.tz_localize(ORIGEM, ambiguous="NaT", nonexistent="NaT")
+        return t.tz_convert(FUSO)
+    except (ValueError, TypeError):
+        return pd.NaT
+
+
+# 2. SILVER: limpeza e filtro antes de juntar os arquivos na memória.
+def carregar_silver(s3, bucket, hosts, agora):
+    partes = []
+    inicio = agora - pd.Timedelta(days=45)
+    paginas = s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=SILVER)
+    for pagina in paginas:
+        for item in pagina.get("Contents", []):
+            if not item["Key"].endswith(".csv"):
+                continue
+            corpo = s3.get_object(Bucket=bucket, Key=item["Key"])["Body"]
+            try:
+                with io.TextIOWrapper(corpo, encoding="utf-8-sig") as texto:
+                    for df in pd.read_csv(texto, sep=";", chunksize=50000):
+                        if not {"HOSTNAME", "TIMESTAMP"}.issubset(df.columns):
+                            raise ValueError(f"CSV sem identificação: {item['Key']}")
+                        df = df[df["HOSTNAME"].isin(hosts)].copy()
+                        if df.empty:
+                            continue
+                        df["TIMESTAMP"] = pd.to_datetime(
+                            df["TIMESTAMP"].map(instante), utc=True).dt.tz_convert(FUSO)
+                        df = df[df["TIMESTAMP"].between(inicio, agora)].copy()
+                        for c in COLUNAS:
+                            df[c] = pd.to_numeric(df[c], errors="coerce") if c in df else np.nan
+                            df[c] = df[c].where(np.isfinite(df[c]) & (df[c] >= 0))
+                            if c.endswith("_PERCENT"):
+                                df[c] = df[c].where(df[c] <= 100)
+                        df["DISCO_USED"] = df["DISCO_USED"].where(
+                            (df["DISCO_TOTAL"] > 0) & (df["DISCO_USED"] <= df["DISCO_TOTAL"]))
+                        df["RAM_AVAILABLE"] = df["RAM_AVAILABLE"].where(
+                            (df["RAM_TOTAL"] > 0) & (df["RAM_AVAILABLE"] <= df["RAM_TOTAL"]))
+                        partes.append(df[["HOSTNAME", "TIMESTAMP"] + COLUNAS])
+            finally:
+                corpo.close()
+    if not partes:
+        raise ValueError("Nenhum dado Silver encontrado para os hosts do cluster.")
+    df = pd.concat(partes, ignore_index=True)
+    return (df.drop_duplicates(["HOSTNAME", "TIMESTAMP"])
+            .sort_values(["HOSTNAME", "TIMESTAMP"]))
+
+
+def limpar_json(valor):
+    if isinstance(valor, dict):
+        return {k: limpar_json(v) for k, v in valor.items()}
+    if isinstance(valor, (list, tuple)):
+        return [limpar_json(v) for v in valor]
+    if isinstance(valor, pd.Timestamp):
+        return valor.isoformat()
+    if valor is None or valor is pd.NA:
+        return None
+    if isinstance(valor, np.generic):
+        return limpar_json(valor.item())
+    if isinstance(valor, float) and not math.isfinite(valor):
+        return None
+    return valor
+
+
+def gravar(s3, bucket, chave, dados, **opcoes):
+    s3.put_object(Bucket=bucket, Key=chave, ContentType="application/json",
+                  Body=json.dumps(limpar_json(dados), ensure_ascii=False,
+                                  allow_nan=False).encode("utf-8"), **opcoes)
+
+
+# Previsão emitida uma vez por período. Reexecuções reutilizam a mesma versão.
+def congelar(s3, bucket, chave, calcular):
+    def ler():
+        resposta = s3.get_object(Bucket=bucket, Key=chave)
+        try:
+            return json.loads(resposta["Body"].read())
+        finally:
+            resposta["Body"].close()
+    try:
+        return ler()
+    except ClientError as e:
+        if e.response["Error"]["Code"] not in ("NoSuchKey", "404"):
+            raise
+    dados = limpar_json(calcular())
+    try:
+        gravar(s3, bucket, chave, dados, IfNoneMatch="*")
+        return dados
+    except ClientError as e:
+        if e.response["Error"]["Code"] not in ("PreconditionFailed", "412"):
+            raise
+        return ler()
+
+
+# 3. BASE HORÁRIA: mínimo de cobertura e um valor por intervalo de coleta.
+def medias_horarias(g):
+    colunas = ["CPU_PERCENT", "RAM_PERCENT"]
+    amostras = g.set_index("TIMESTAMP")[colunas].resample(f"{PASSO}s").mean()
+    media = amostras.resample("1h").mean()
+    contagem = amostras.resample("1h").count()
+    return media.where(contagem >= math.ceil(3600 / PASSO * COBERTURA))
+
+
+# 4. GRÁFICO 1: último disco do dia e regressão dos 30 dias anteriores à semana.
+def disco(g, semana, corte, previsao=None):
+    dias = pd.date_range(semana, periods=7, freq="D")
+    validos = g.dropna(subset=["DISCO_USED", "DISCO_TOTAL"]).copy()
+    if validos.empty:
+        return None
+    validos["DIA"] = validos["TIMESTAMP"].dt.normalize()
+    diarios = validos.groupby("DIA").tail(1).set_index("DIA")
+    capacidade = float(validos.iloc[-1]["DISCO_TOTAL"]) / 1e12
+    if capacidade <= 0:
+        return None
+    if previsao is None:
+        h = diarios[(diarios.index >= semana - pd.Timedelta(days=30)) &
+                    (diarios.index < semana)].copy()
+        # Só considerar fechamento coletado na última hora do dia.
+        h = h[(h.index + pd.Timedelta(days=1) - h["TIMESTAMP"]) <= pd.Timedelta(hours=1)]
+        previstos = [None] * 7
+        if (len(h) >= 7 and h["DISCO_TOTAL"].nunique() == 1
+                and h["DISCO_TOTAL"].iloc[-1] == validos.iloc[-1]["DISCO_TOTAL"]):
+            x = np.array([(d - semana).total_seconds() / 86400 for d in h.index])
+            b, a = np.polyfit(x, h["DISCO_USED"].to_numpy(dtype=float) / 1e12, 1)
+            previstos = [max(0.0, float(a + b * i)) for i in range(7)]
+        return {"capacidade": capacidade, "previsto": previstos}
+    real = diarios["DISCO_USED"].reindex(dias) / 1e12
+    real = real.where(dias <= corte.normalize())
+    previstos = previsao["previsto"] if previsao["capacidade"] == capacidade else [None] * 7
+    return {"volume": os.environ["DISCO_VOLUME"], "capacidade": capacidade,
+            "datas": [d.date().isoformat() for d in dias],
+            "real": real.tolist(), "previsto": previstos}
+
+
+# 5. GRÁFICO 2: sete dias completos; cada dia possui 24 horas.
+def calor(horas, hoje):
+    dias = pd.date_range(hoje - pd.Timedelta(days=7), periods=7, freq="D")
+    linhas = []
+    for d in dias:
+        h = horas.reindex(pd.date_range(d, periods=24, freq="1h"))
+        linhas.append([{"CPU": r.CPU_PERCENT, "RAM": r.RAM_PERCENT}
+                       for r in h.itertuples()])
+    return {"dias": [d.date().isoformat() for d in dias], "leituras": linhas}
+
+
+# 6. GRÁFICO 3: referência das mesmas horas de 7 e 14 dias atrás.
+def consumo(horas, hoje, corte, previsao=None):
+    datas = pd.date_range(hoje, periods=24, freq="1h")
+    if previsao is None:
+        resultado = {}
+        for recurso, coluna in [("cpuExpected", "CPU_PERCENT"), ("ramExpected", "RAM_PERCENT")]:
+            anterior = horas[coluna].reindex(datas - pd.Timedelta(days=7)).to_numpy()
+            anterior2 = horas[coluna].reindex(datas - pd.Timedelta(days=14)).to_numpy()
+            # Se uma das duas horas falta, a previsão daquela hora permanece null.
+            resultado[recurso] = ((anterior + anterior2) / 2).tolist()
+        return resultado
+    real = horas.reindex(datas).copy()
+    real.loc[real.index >= corte.floor("1h"), :] = np.nan
+    return {"datas": [d.isoformat() for d in datas],
+            "cpuObserved": real["CPU_PERCENT"].tolist(),
+            "ramObserved": real["RAM_PERCENT"].tolist(), **previsao}
+
+
+# 7. GRÁFICO 5: percentuais de RAM e contadores reais de swap, últimas 24 horas.
+def memoria(g, corte):
+    if os.getenv("SWAP_CONTADORES_DISPONIVEIS", "false").lower() != "true":
+        return None
+    janela = g[g["TIMESTAMP"].between(corte - pd.Timedelta(hours=24), corte)].copy()
+    if len(janela) < 2:
+        return None
+    total_swap = janela["SWAP_USED"] + janela["SWAP_FREE"]
+    if not total_swap.notna().any():
+        return None
+    sem_swap = bool((total_swap.dropna() == 0).all())
+    disponivel = janela["RAM_AVAILABLE"] / janela["RAM_TOTAL"] * 100
+    return {"semSwap": sem_swap, "leituras": [
+        {"timestamp": r.TIMESTAMP.isoformat(), "ramDisponivel": disponivel.loc[i],
+         "swapIn": r.SWAP_IN, "swapOut": r.SWAP_OUT}
+        for i, r in janela.iterrows()]}
+
+
+# 8. KPI 2: média de cada componente desde segunda até a última coleta.
+# Cada intervalo de coleta tem o mesmo peso; valores ausentes não viram zero.
+def medias_semana(g, semana, corte):
+    janela = g[g["TIMESTAMP"].between(semana, corte)].copy()
+    if janela.empty:
+        return None
+    janela["CPU"] = janela["CPU_PERCENT"]
+    janela["RAM"] = janela["RAM_PERCENT"]
+    janela["Disco"] = janela["DISCO_USED"] / janela["DISCO_TOTAL"].where(janela["DISCO_TOTAL"] > 0) * 100
+    total_swap = janela["SWAP_USED"] + janela["SWAP_FREE"]
+    janela["Swap"] = janela["SWAP_USED"] / total_swap.where(total_swap > 0) * 100
+    componentes = ["CPU", "RAM", "Disco", "Swap"]
+    valores = janela.set_index("TIMESTAMP")[componentes]
+    valores = valores.where((valores >= 0) & (valores <= 100))
+    intervalos = valores.resample(f"{PASSO}s").mean()
+    return limpar_json({
+        "inicio": semana,
+        "fim": corte,
+        "valores": intervalos.mean().to_dict(),
+        "amostras": intervalos.count().to_dict()
+    })
+
+
+# 9. EXECUÇÃO: publica somente o contrato consumido pela dashboard atual.
+def executar():
+    if not 0 < PASSO <= 300 or 3600 % PASSO or not 0 < COBERTURA <= 1:
+        raise ValueError("COLETA_SEGUNDOS deve dividir 3600; cobertura deve estar entre 0 e 1.")
+    bucket = os.environ["BUCKET_NAME"]
+    cluster_id = int(os.environ["GESTOR_CLUSTER_ID"])
+    if cluster_id <= 0:
+        raise ValueError("GESTOR_CLUSTER_ID inválido.")
+    hosts = buscar_hosts(cluster_id)
+    if not hosts:
+        raise ValueError("Cluster sem nodes cadastrados.")
+    s3 = boto3.client("s3", region_name=os.getenv("AWS_REGION", os.getenv("REGION_NAME", "us-east-1")))
+    agora = pd.Timestamp.now(tz=FUSO)
+    bucket_silver = os.getenv("SILVER_BUCKET_NAME", bucket)
+    df = carregar_silver(s3, bucket_silver, hosts, agora)
+    if df.empty:
+        raise ValueError("Silver sem leituras válidas no período; publicação cancelada.")
+    hoje = agora.normalize()
+    semana = hoje - pd.Timedelta(days=hoje.dayofweek)
+    base = f"{GOLD}/cluster={cluster_id}"
+    nodes = []
+    for host in hosts:
+        g = df[df["HOSTNAME"] == host].copy()
+        if g.empty:
+            continue  # O cadastro do banco continua exibindo esse node como sem telemetria.
+        corte = min(agora, g["TIMESTAMP"].max())
+        horas = medias_horarias(g)
+        caminho_host = quote(host, safe="")
+        chave_disco = f"{base}/previsoes-v2/disco/{semana.date()}/{caminho_host}.json"
+        chave_consumo = f"{base}/previsoes-v2/consumo/{hoje.date()}/{caminho_host}.json"
+        prev_disco = congelar(s3, bucket, chave_disco, lambda: disco(g, semana, corte))
+        prev_consumo = congelar(s3, bucket, chave_consumo, lambda: consumo(horas, hoje, corte))
+        nodes.append({"hostname": host, "disco": disco(g, semana, corte, prev_disco) if prev_disco else None,
+                      "calor": calor(horas, hoje), "consumo": consumo(horas, hoje, corte, prev_consumo),
+                      "memoria": memoria(g, corte), "medias_semana": medias_semana(g, semana, corte)})
+    painel = {"schema_version": 2,
+              "metadados": {"cluster_id": cluster_id, "gerado_em": agora,
+                            "telemetria_ate": df["TIMESTAMP"].max(), "demonstrativo": False},
+              "nodes": nodes}
+    chave = f"{base}/dashboard.json"
+    gravar(s3, bucket, chave, painel)
+    print(f"Gold publicada: s3://{bucket}/{chave} | {len(nodes)} nodes com telemetria")
+    return {"bucket": bucket, "chave": chave, "nodes": len(nodes)}
+
+
+def lambda_handler(event, context):
+    """Entrada da Lambda; a execução é acionada externamente."""
+    for variavel in ("BUCKET_NAME", "GESTOR_CLUSTER_ID", "HOSTNAMES", "DISCO_VOLUME"):
+        if not os.getenv(variavel):
+            raise ValueError(f"Configure a variável {variavel} na Lambda.")
+    return executar()
+
+
+if __name__ == "__main__":
+    executar()
