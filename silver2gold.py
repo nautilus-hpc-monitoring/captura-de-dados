@@ -1014,6 +1014,14 @@ def processar_camada_gold():
         processar_camada_gold_gestor()
         analista = processar_camada_gold_analista()
         operador = processar_camada_gold_operador()
+        if os.getenv("INTERPRETACAO_ATIVA", "false").lower() == "true":
+            try:
+                from silver2gold_interpretacao import (
+                    processar_camada_gold_interpretacao,
+                )
+                processar_camada_gold_interpretacao()
+            except Exception as e:
+                print(f"Interpretação falhou: {e}")
         return {'analista': analista, 'operador': operador}
     finally:
         shutil.rmtree('silver_local', ignore_errors=True)
