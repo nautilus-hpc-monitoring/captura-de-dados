@@ -5,3 +5,7 @@ python-dotenv==1.0.1
 requests>=2.32,<3
 psutil>=6,<8
 pymysql>=1.1,<2
+
+# ETL ISA — Versões declaradas no requirements original da interpretação.
+scikit-learn==1.9.1
+joblib==1.6.0

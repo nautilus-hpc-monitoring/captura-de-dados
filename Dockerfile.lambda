@@ -1,10 +1,11 @@
 FROM public.ecr.aws/lambda/python:3.12
 
-COPY requirements-lambda.txt ${LAMBDA_TASK_ROOT}/
-RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements-lambda.txt
+COPY --chmod=644 requirements-lambda.txt ${LAMBDA_TASK_ROOT}/
+RUN umask 022 && pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements-lambda.txt
 
 # Inclui as ETLs e os módulos Python da raiz, inclusive config_aws e local2bronze.
 # Importar o coletor não inicia sua captura: a captura depende do bloco __main__.
-COPY *.py ${LAMBDA_TASK_ROOT}/
+COPY --chmod=644 *.py ${LAMBDA_TASK_ROOT}/
+RUN chmod -R a+rX ${LAMBDA_TASK_ROOT}
 
 CMD ["lambda_function.lambda_handler"]

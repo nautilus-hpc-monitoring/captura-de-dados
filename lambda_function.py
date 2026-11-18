@@ -1,7 +1,9 @@
 """Entrada compartilhada das Lambdas da equipe.
 
 Configure ETL_MODULO com o nome do arquivo, sem .py.
-Exemplos: bronze2silver, silver2gold ou silver2gold_analista.
+Exemplos: bronze2silver ou silver2gold.
+Para a ETL Isa use ETL_MODULO=silver2gold e GOLD_DASHBOARD=analista.
+ETL_MODULO=silver2gold e GOLD_DASHBOARD=ambas executam João e Isa juntos.
 """
 import importlib
 import os
