@@ -229,10 +229,8 @@ def consumo(horas, hoje, corte, previsao=None):
             "ramObserved": real["RAM_PERCENT"].tolist(), **previsao}
 
 
-# 7. GRÁFICO 5: percentuais de RAM e contadores reais de swap, últimas 24 horas.
+# 7. GRÁFICO 5: RAM e ocupação da swap, disponíveis também no Windows.
 def memoria(g, corte):
-    if os.getenv("SWAP_CONTADORES_DISPONIVEIS", "false").lower() != "true":
-        return None
     janela = g[g["TIMESTAMP"].between(corte - pd.Timedelta(hours=24), corte)].copy()
     if len(janela) < 2:
         return None
@@ -241,8 +239,11 @@ def memoria(g, corte):
         return None
     sem_swap = bool((total_swap.dropna() == 0).all())
     disponivel = janela["RAM_AVAILABLE"] / janela["RAM_TOTAL"] * 100
+    percentual_swap = janela["SWAP_USED"] / total_swap.where(total_swap > 0) * 100
+    percentual_swap = percentual_swap.where(percentual_swap.between(0, 100))
     return {"semSwap": sem_swap, "leituras": [
         {"timestamp": r.TIMESTAMP.isoformat(), "ramDisponivel": disponivel.loc[i],
+         "swapPercent": percentual_swap.loc[i],
          "swapIn": r.SWAP_IN, "swapOut": r.SWAP_OUT}
         for i, r in janela.iterrows()]}
 
