@@ -99,3 +99,79 @@ def baixar_arquivos_modelo():
         raise ValueError("baseline.json inválido ou vazio.")
 
     return modelo, baseline
+
+def validar_compatibilidade(df, baseline):
+    avisos = []
+
+    if df.empty:
+        return df.copy(), avisos
+
+    hosts = df["HOSTNAME"].astype(str).unique()
+
+    fora_do_baseline = sorted(
+        host
+        for host in hosts
+        if host not in baseline
+    )
+
+    for host in fora_do_baseline:
+        avisos.append(
+            f"Node sem chave no baseline: {host}"
+        )
+
+    df = df[
+        df["HOSTNAME"].astype(str).isin(baseline.keys())
+    ].copy()
+
+    if df.empty:
+        return df, avisos
+
+    colunas_presentes = [
+        coluna
+        for coluna in COLUNAS_CONSTANTES
+        if coluna in df.columns
+    ]
+
+    for coluna in COLUNAS_CONSTANTES:
+        if coluna not in df.columns:
+            avisos.append(
+                f"Coluna constante ausente nos dados: {coluna}"
+            )
+
+    for host, grupo in df.groupby("HOSTNAME"):
+        baseline_node = baseline.get(str(host))
+
+        if not baseline_node:
+            continue
+
+        mediana_baseline = baseline_node.get("mediana", {})
+
+        for coluna in colunas_presentes:
+            if coluna not in mediana_baseline:
+                avisos.append(
+                    f"Coluna constante ausente no baseline: {coluna}"
+                )
+                continue
+
+            valores = grupo[coluna].dropna()
+
+            if valores.empty:
+                continue
+
+            atual = float(valores.median())
+            base = float(mediana_baseline[coluna])
+
+            if base == 0:
+                divergente = abs(atual - base) > 1e-9
+            else:
+                divergente = (
+                    abs(atual - base) / abs(base) > 0.01
+                )
+
+            if divergente:
+                avisos.append(
+                    f"Mediana de {coluna} divergente para {host}: "
+                    f"atual={atual:.2f}, baseline={base:.2f}"
+                )
+
+    return df.reset_index(drop=True), avisos
