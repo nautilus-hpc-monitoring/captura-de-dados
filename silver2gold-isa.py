@@ -779,3 +779,43 @@ def dados_dash(historico, consolidacao):
         "nodes": nodes,
         "consolidacao_diaria": cards_diarios,
     }
+
+def processar_categorizacao():
+    modelo, baseline = baixar_arquivos_modelo
+
+    hosts = buscar_todos()
+    agora = pd.Timestamp.now(tz=FUSO)
+
+    df = carregar_silver(os.getenv('BUCKET_NAME'), os.getenv('SILVER_BUCKET_NAME'), hosts, agora)
+
+    relatorio = executar_interpretacao(
+        df,
+        modelo,
+        baseline,
+    )
+
+    historico = atualizar_historico_interpretacao(
+        relatorio["episodios"]
+    )
+
+    dashboard = dados_dash(
+        historico
+    )
+
+    gravar(
+        CHAVE_INTERPRETACAO_LATEST,
+        relatorio,
+    )
+
+    gravar(
+        CHAVE_DASHBOARD,
+        dashboard,
+    )
+
+    metadados = relatorio["metadados"]
+    return dashboard
+
+
+CHAVE_INTERPRETACAO_LATEST = (
+    PREFIXO_CATEGORIZACAO + "latest.json"
+)
