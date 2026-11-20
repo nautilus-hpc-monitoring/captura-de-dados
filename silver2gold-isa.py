@@ -13,6 +13,8 @@ PISO_MAD = 0.5
 HORAS_JANELA = 24
 FUSO_HORARIO = ZoneInfo("America/Sao_Paulo")
 HORARIO_CONSOLIDACAO = 5
+MIN_EPISODIO = 5
+GAP_MINUTOS = 1
 
 PREFIXO_CATEGORIZACAO = "03-gold/categorizacao/"
 PREFIXO_DASHBOARD = "03-gold/dashboard-categorica/"
@@ -190,3 +192,78 @@ def detectar_anomalias(df, modelo, colunas):
     df["score"] = modelo.decision_function(matriz)
 
     return df
+
+def criar_episodio(hostname, registros, max_node):
+    if len(registros) < MIN_EPISODIO:
+        return None
+
+    inicio = registros["TIMESTAMP"].iloc[0]
+    fim = registros["TIMESTAMP"].iloc[-1]
+
+    return {
+        "episodio_id": f"{hostname}|{inicio.isoformat()}",
+        "hostname": str(hostname),
+        "inicio": inicio,
+        "fim": fim,
+        "duracao_segundos": int(
+            (fim - inicio).total_seconds()
+        ),
+        "quantidade_registros_anomalos": int(len(registros)),
+        "registros": registros.copy(),
+    }
+
+def consolidar_episodios(df):
+    if df.empty or "anomalia" not in df.columns:
+        return []
+
+    max_por_node = (
+        df.groupby("HOSTNAME")["TIMESTAMP"].max().to_dict()
+    )
+
+    episodios = []
+
+    for hostname, grupo in df.groupby("HOSTNAME"):
+        anomalos = grupo[
+            grupo["anomalia"] == -1
+        ].sort_values("TIMESTAMP")
+
+        if anomalos.empty:
+            continue
+
+        max_node = max_por_node.get(hostname)
+        inicio_bloco = 0
+
+        for indice in range(1, len(anomalos)):
+            diferenca = (
+                anomalos.iloc[indice]["TIMESTAMP"]
+                - anomalos.iloc[indice - 1]["TIMESTAMP"]
+            )
+
+            if diferenca > timedelta(minutes=GAP_MINUTOS):
+                episodio = criar_episodio(
+                    hostname,
+                    anomalos.iloc[inicio_bloco:indice],
+                    max_node
+                )
+
+                if episodio is not None:
+                    episodios.append(episodio)
+
+                inicio_bloco = indice
+
+        episodio = criar_episodio(
+            hostname,
+            anomalos.iloc[inicio_bloco:],
+            max_node
+        )
+
+        if episodio is not None:
+            episodios.append(episodio)
+
+    return sorted(
+        episodios,
+        key=lambda episodio: (
+            episodio["hostname"],
+            episodio["inicio"],
+        ),
+    )
