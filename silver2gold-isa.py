@@ -671,3 +671,111 @@ def atualizar_historico_interpretacao(novos):
 
     return atualizado
 
+def agregar_categorias(historico):
+    contagem = {}
+
+    for episodio in historico:
+        categoria = episodio["categoria"]["nome"]
+
+        contagem[categoria] = (
+            contagem.get(categoria, 0) + 1
+        )
+
+    return [
+        {
+            "nome": nome,
+            "quantidade_episodios": quantidade,
+        }
+        for nome, quantidade in sorted(
+            contagem.items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+    ]
+
+def agregar_nodes(historico):
+    contagem = {}
+
+    for episodio in historico:
+        hostname = episodio["hostname"]
+
+        contagem[hostname] = (
+            contagem.get(hostname, 0) + 1
+        )
+
+    return [
+        {
+            "hostname": hostname,
+            "quantidade_episodios": quantidade,
+        }
+        for hostname, quantidade in sorted(
+            contagem.items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+    ]
+
+def dados_dash(historico, consolidacao):
+    categorias = agregar_categorias(
+        historico
+    )
+
+    nodes = agregar_nodes(
+        historico
+    )
+
+    total_episodios = len(historico)
+
+    node_mais_problematico = (
+        nodes[0]
+        if nodes
+        else None
+    )
+
+    categoria_mais_comum = (
+        categorias[0]
+        if categorias
+        else None
+    )
+
+    data_cards = consolidacao.get(
+        "ultima_data_processada"
+    )
+
+    cards_diarios = (
+        consolidacao.get("dias", {}).get(
+            data_cards,
+            {
+                "data_referencia": data_cards,
+                "atualizado_em": None,
+                "total_episodios": 0,
+                "nodes": [],
+            },
+        )
+        if data_cards
+        else {
+            "data_referencia": None,
+            "atualizado_em": None,
+            "total_episodios": 0,
+            "nodes": [],
+        }
+    )
+
+    return {
+        "schema_version": "2.0",
+        "metadados": {
+            "gerado_em": datetime.now(
+                FUSO
+            ).isoformat(),
+            "fuso_horario": "America/Sao_Paulo",
+            "total_episodios_historicos": total_episodios,
+            "total_nodes": len(nodes),
+            "total_categorias": len(categorias),
+        },
+        "indicadores": {
+            "node_mais_problematico": node_mais_problematico,
+            "categoria_mais_comum": categoria_mais_comum,
+            "total_episodios": total_episodios,
+        },
+        "categorias": categorias,
+        "nodes": nodes,
+        "consolidacao_diaria": cards_diarios,
+    }
