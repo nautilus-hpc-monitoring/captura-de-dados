@@ -1,8 +1,10 @@
 from silver2gold import *
+from config_aws import s3_client
 import tempfile
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 import joblib
+
 
 MODELO_VERSAO = os.getenv("MODELO_VERSAO", "v1")
 LIMIAR_Z = 3.0
@@ -50,4 +52,50 @@ def buscar_todos():
     finally:
         conexao.close()
 
+def diretorio_cache():
+    return os.path.join(
+        tempfile.gettempdir(),
+        "isolation-forest",
+        MODELO_VERSAO,
+    )
 
+def arquivos_modelo(nome):
+    diretorio = diretorio_cache
+    os.makedirs(diretorio, exist_ok=True)
+    caminho = os.path.join(diretorio, nome)
+
+    if os.path.exists(caminho) and os.path.getsize(caminho) > 0:
+        return caminho
+
+    bucket = os.getenv("BUCKET_NAME")
+
+    if not bucket:
+        raise ValueError("A variável BUCKET_NAME não foi configurada.")
+
+    chave = f"modelos/{MODELO_VERSAO}/{nome}"
+
+    try:
+        s3_client.download_file(bucket, chave, caminho)
+    except Exception as erro:
+        raise RuntimeError(
+            f"Não foi possível baixar o artefato {chave} do S3: {erro}"
+        ) from erro
+
+    if not os.path.exists(caminho) or os.path.getsize(caminho) == 0:
+        raise FileNotFoundError(f"Artefato ausente ou vazio: {caminho}")
+
+    return caminho
+
+def baixar_arquivos_modelo():
+    caminho_modelo = arquivos_modelo("isolation_forest.joblib")
+    caminho_baseline = arquivos_modelo("baseline.json")
+
+    modelo = joblib.load(caminho_modelo)
+
+    with open(caminho_baseline, "r", encoding="utf-8") as arquivo:
+        baseline = json.load(arquivo)
+
+    if not isinstance(baseline, dict) or not baseline:
+        raise ValueError("baseline.json inválido ou vazio.")
+
+    return modelo, baseline
