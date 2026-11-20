@@ -547,4 +547,127 @@ def executar_interpretacao(df, modelo, colunas, baseline):
         "episodios": episodios_json,
     }
 
+def mesclar_episodios(historico, novos):
+    resultado = list(historico)
+
+    for novo in novos:
+        inicio_novo = instante(
+            novo["inicio"]
+        )
+
+        fim_novo = instante(
+            novo["fim"]
+        )
+
+        correspondencia = None
+
+        for indice, existente in enumerate(resultado):
+            if existente["hostname"] != novo["hostname"]:
+                continue
+
+            inicio_existente = instante(
+                existente["inicio"]
+            )
+
+            fim_existente = instante(
+                existente["fim"]
+            )
+
+            distancia = max(
+                inicio_existente - fim_novo,
+                inicio_novo - fim_existente,
+                timedelta(0),
+            )
+
+            if distancia <= timedelta(minutes=GAP_MINUTOS):
+                correspondencia = indice
+                break
+
+        if correspondencia is None:
+            resultado.append(novo)
+            continue
+
+        existente = resultado[correspondencia]
+
+        inicio_final = min(
+            instante(
+                existente["inicio"]
+            ),
+            inicio_novo,
+        )
+
+        fim_final = max(
+            instante(
+                existente["fim"]
+            ),
+            fim_novo,
+        )
+
+        resultado[correspondencia] = {
+            **existente,
+            **novo,
+            "episodio_id": (
+                f"{novo['hostname']}|{inicio_final.isoformat()}"
+            ),
+            "inicio": inicio_final.isoformat(),
+            "fim": fim_final.isoformat(),
+            "duracao_segundos": int(
+                (fim_final - inicio_final).total_seconds()
+            ),
+            "quantidade_registros_anomalos": max(
+                existente["quantidade_registros_anomalos"],
+                novo["quantidade_registros_anomalos"],
+            ),
+        }
+
+    resultado.sort(
+        key=lambda episodio: (
+            episodio["hostname"],
+            episodio["inicio"],
+        )
+    )
+
+    return resultado
+
+def ler_json(chave, padrao):
+    from config_aws import s3_client
+
+    try:
+        resposta = s3_client.get_object(
+            Bucket=os.getenv('BUCKET_NAME'),
+            Key=chave,
+        )
+
+        conteudo = resposta["Body"].read().decode("utf-8")
+        return json.loads(conteudo)
+
+    except ClientError as erro:
+        codigo = erro.response.get("Error", {}).get("Code")
+
+        if codigo in ("NoSuchKey", "404", "NotFound"):
+            return padrao
+
+        raise
+
+def atualizar_historico_interpretacao(novos):
+    historico = ler_json(
+        CHAVE_HISTORICO,
+        [],
+    )
+
+    if not isinstance(historico, list):
+        raise ValueError("Histórico de episódios inválido.")
+
+    atualizado = mesclar_episodios(
+        historico,
+        novos,
+    )
+
+    gravar(
+        os.getenv('BUCKET_NAME'),
+        CHAVE_HISTORICO,
+        atualizado,
+    )
+
+    return atualizado
 
