@@ -11,7 +11,6 @@ LIMIAR_Z = 3.0
 PISO_MAD = 0.5
 
 HORAS_JANELA = 24
-FUSO_HORARIO = ZoneInfo("America/Sao_Paulo")
 HORARIO_CONSOLIDACAO = 5
 MIN_EPISODIO = 5
 GAP_MINUTOS = 1
@@ -267,3 +266,285 @@ def consolidar_episodios(df):
             episodio["inicio"],
         ),
     )
+
+def mad_interpretacao(metrica):
+    return 1.0 if metrica == "LOAD_AVG_1" else PISO_MAD
+
+def calcular_zscores(registros, baseline_node):
+    mediana_baseline = baseline_node.get("mediana", {})
+    mad_baseline = baseline_node.get("mad", {})
+
+    resultado = {}
+
+    for metrica in METRICAS_CATEGORIZACAO:
+        if (
+            metrica not in registros.columns
+            or metrica not in mediana_baseline
+            or metrica not in mad_baseline
+        ):
+            resultado[metrica] = {
+                "z": None,
+                "valor_mediano": None,
+                "normal_mediana": None,
+            }
+            continue
+
+        valores = pd.to_numeric(
+            registros[metrica],
+            errors="coerce",
+        ).dropna()
+
+        if valores.empty:
+            resultado[metrica] = {
+                "z": None,
+                "valor_mediano": None,
+                "normal_mediana": float(
+                    mediana_baseline[metrica]
+                ),
+            }
+            continue
+
+        mediana = float(mediana_baseline[metrica])
+        mad = float(mad_baseline[metrica])
+
+        denominador = (
+            1.4826
+            * max(
+                mad,
+                mad_interpretacao(metrica),
+            )
+        )
+
+        z_serie = (valores - mediana) / denominador
+
+        z_mediana = float(z_serie.median())
+        valor_mediano = float(valores.median())
+
+        resultado[metrica] = {
+            "z": (
+                z_mediana
+                if math.isfinite(z_mediana)
+                else None
+            ),
+            "valor_mediano": (
+                valor_mediano
+                if math.isfinite(valor_mediano)
+                else None
+            ),
+            "normal_mediana": (
+                mediana
+                if math.isfinite(mediana)
+                else None
+            ),
+        }
+
+    return resultado
+
+
+def categorizar_episodio(zscores):
+    nomes = {
+        0: "Não classificado",
+        1: "Pressão de processamento",
+        2: "Degradação de memória",
+        3: "Degradação de disco",
+        4: "Pressão combinada",
+    }
+
+    destaque = [
+        metrica
+        for metrica in METRICAS_CATEGORIZACAO
+        if zscores.get(metrica, {}).get("z") is not None
+        and zscores[metrica]["z"] > LIMIAR_Z
+    ]
+
+    destaque.sort(
+        key=lambda metrica: zscores[metrica]["z"],
+        reverse=True,
+    )
+
+    if "DISCO_PERCENT" in destaque:
+        codigo = 3
+        assinatura = [
+            "DISCO_PERCENT",
+            "SWAP_PERCENT",
+        ]
+
+    elif "RAM_PERCENT" in destaque and (
+        "SWAP_PERCENT" in destaque
+        or "CPU_IOWAIT_PERCENT" in destaque
+    ):
+        codigo = 2
+        assinatura = [
+            "RAM_PERCENT",
+            "SWAP_PERCENT",
+            "CPU_IOWAIT_PERCENT",
+        ]
+
+    elif (
+        "RAM_PERCENT" in destaque
+        and "CPU_PERCENT" in destaque
+    ):
+        codigo = 4
+        assinatura = [
+            "CPU_PERCENT",
+            "RAM_PERCENT",
+        ]
+
+    elif (
+        "CPU_PERCENT" in destaque
+        and "LOAD_AVG_1" in destaque
+    ):
+        codigo = 1
+        assinatura = [
+            "CPU_PERCENT",
+            "LOAD_AVG_1",
+        ]
+
+    else:
+        codigo = 0
+        assinatura = []
+
+    severidade_z = max(
+        (
+            zscores[metrica]["z"]
+            for metrica in destaque
+        ),
+        default=0.0,
+    )
+
+    if codigo == 0:
+        cobertura = 0.0
+    else:
+        cobertura = (
+            len(set(assinatura) & set(destaque))
+            / len(assinatura)
+        )
+
+    metricas_destaque = [
+        {
+            "metrica": metrica,
+            "z": zscores[metrica]["z"],
+            "valor_mediano": zscores[metrica]["valor_mediano"],
+            "normal_mediana": zscores[metrica]["normal_mediana"],
+        }
+        for metrica in destaque
+    ]
+
+    return {
+        "codigo": codigo,
+        "nome": nomes[codigo],
+        "severidade_z": severidade_z,
+        "cobertura_assinatura": cobertura,
+        "metricas_destaque": metricas_destaque,
+    }
+
+def converter_num(valor):
+    if valor is None:
+        return None
+
+    try:
+        numero = float(valor)
+    except (TypeError, ValueError):
+        return None
+
+    if not math.isfinite(numero):
+        return None
+
+    return round(numero, 2)
+
+def executar_interpretacao(df, modelo, colunas, baseline):
+    df_validado, avisos = validar_compatibilidade(
+        df,
+        baseline,
+    )
+
+    df_detectado = detectar_anomalias(
+        df_validado,
+        modelo,
+        colunas,
+    )
+
+    episodios = consolidar_episodios(
+        df_detectado
+    )
+
+    episodios_json = []
+
+    for episodio in episodios:
+        hostname = str(episodio["hostname"])
+        baseline_node = baseline.get(hostname, {})
+
+        zscores = calcular_zscores(
+            episodio["registros"],
+            baseline_node,
+        )
+
+        categoria = categorizar_episodio(
+            zscores
+        )
+
+        metricas_destaque = [
+            {
+                "metrica": item["metrica"],
+                "z": converter_num(item["z"]),
+                "valor_mediano": converter_num(
+                    item["valor_mediano"]
+                ),
+                "normal_mediana": converter_num(
+                    item["normal_mediana"]
+                ),
+            }
+            for item in categoria["metricas_destaque"]
+        ]
+
+        episodios_json.append(
+            {
+                "episodio_id": episodio["episodio_id"],
+                "hostname": hostname,
+                "inicio": episodio["inicio"].isoformat(),
+                "fim": episodio["fim"].isoformat(),
+                "duracao_segundos": int(
+                    episodio["duracao_segundos"]
+                ),
+                "quantidade_registros_anomalos": int(
+                    episodio["quantidade_registros_anomalos"]
+                ),
+                "categoria": {
+                    "codigo": int(categoria["codigo"]),
+                    "nome": categoria["nome"],
+                },
+                "severidade_z": converter_num(
+                    categoria["severidade_z"]
+                ),
+                "cobertura_assinatura": converter_num(
+                    categoria["cobertura_assinatura"]
+                ),
+                "metricas_destaque": metricas_destaque,
+            }
+        )
+
+    quantidade_anomalias = (
+        int((df_detectado["anomalia"] == -1).sum())
+        if not df_detectado.empty
+        else 0
+    )
+
+    return {
+        "schema_version": "2.0",
+        "metadados": {
+            "gerado_em": datetime.now(
+                FUSO
+            ).isoformat(),
+            "modelo_versao": MODELO_VERSAO,
+            "janela_horas": int(HORAS_JANELA),
+            "quantidade_registros": int(
+                len(df_detectado)
+            ),
+            "quantidade_anomalias": quantidade_anomalias,
+            "quantidade_episodios": len(episodios_json),
+            "avisos": avisos,
+        },
+        "episodios": episodios_json,
+    }
+
+
