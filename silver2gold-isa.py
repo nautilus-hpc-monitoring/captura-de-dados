@@ -1,4 +1,34 @@
 from silver2gold import *
+import tempfile
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+import joblib
+
+MODELO_VERSAO = os.getenv("MODELO_VERSAO", "v1")
+LIMIAR_Z = 3.0
+PISO_MAD = 0.5
+
+HORAS_JANELA = 24
+FUSO_HORARIO = ZoneInfo("America/Sao_Paulo")
+HORARIO_CONSOLIDACAO = 5
+
+PREFIXO_CATEGORIZACAO = "03-gold/categorizacao/"
+PREFIXO_DASHBOARD = "03-gold/dashboard-categorica/"
+
+CHAVE_HISTORICO = PREFIXO_CATEGORIZACAO + "historico_episodios.json"
+CHAVE_CONSOLIDACAO = PREFIXO_DASHBOARD + "consolidacao_diaria.json"
+CHAVE_DASHBOARD = PREFIXO_DASHBOARD + "dashboard.json"
+
+METRICAS_CATEGORIZACAO = [
+    "CPU_PERCENT",
+    "LOAD_AVG_1",
+    "RAM_PERCENT",
+    "SWAP_PERCENT",
+    "DISCO_PERCENT",
+    "CPU_IOWAIT_PERCENT",
+]
+
+COLUNAS_CONSTANTES = ["CPU_COUNT_LOGICA", "RAM_TOTAL", "DISCO_TOTAL"]
 
 def buscar_todos():
     if os.getenv("HOSTNAMES"):
@@ -19,3 +49,5 @@ def buscar_todos():
             return [r[0] for r in cursor.fetchall()]
     finally:
         conexao.close()
+
+
