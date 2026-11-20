@@ -76,9 +76,12 @@ def instante(valor):
 
 
 # 2. SILVER: limpeza e filtro antes de juntar os arquivos na memória.
-def carregar_silver(s3, bucket, hosts, agora):
+def carregar_silver(s3, bucket, hosts, agora, inicio=None, colunas=None):
     partes = []
-    inicio = agora - pd.Timedelta(days=45)
+    if inicio is None:
+        inicio = agora - pd.Timedelta(days=45)
+    if colunas is None:
+        colunas = COLUNAS
     paginas = s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=SILVER)
     for pagina in paginas:
         for item in pagina.get("Contents", []):
@@ -96,16 +99,18 @@ def carregar_silver(s3, bucket, hosts, agora):
                         df["TIMESTAMP"] = pd.to_datetime(
                             df["TIMESTAMP"].map(instante), utc=True).dt.tz_convert(FUSO)
                         df = df[df["TIMESTAMP"].between(inicio, agora)].copy()
-                        for c in COLUNAS:
+                        for c in colunas:
                             df[c] = pd.to_numeric(df[c], errors="coerce") if c in df else np.nan
                             df[c] = df[c].where(np.isfinite(df[c]) & (df[c] >= 0))
                             if c.endswith("_PERCENT"):
                                 df[c] = df[c].where(df[c] <= 100)
-                        df["DISCO_USED"] = df["DISCO_USED"].where(
-                            (df["DISCO_TOTAL"] > 0) & (df["DISCO_USED"] <= df["DISCO_TOTAL"]))
-                        df["RAM_AVAILABLE"] = df["RAM_AVAILABLE"].where(
-                            (df["RAM_TOTAL"] > 0) & (df["RAM_AVAILABLE"] <= df["RAM_TOTAL"]))
-                        partes.append(df[["HOSTNAME", "TIMESTAMP"] + COLUNAS])
+                        if "DISCO_USED" in colunas and "DISCO_TOTAL" in df:
+                            df["DISCO_USED"] = df["DISCO_USED"].where(
+                                (df["DISCO_TOTAL"] > 0) & (df["DISCO_USED"] <= df["DISCO_TOTAL"]))
+                        if "RAM_AVAILABLE" in colunas and "RAM_TOTAL" in df:
+                            df["RAM_AVAILABLE"] = df["RAM_AVAILABLE"].where(
+                                (df["RAM_TOTAL"] > 0) & (df["RAM_AVAILABLE"] <= df["RAM_TOTAL"]))
+                        partes.append(df[["HOSTNAME", "TIMESTAMP"] + colunas])
             finally:
                 corpo.close()
     if not partes:

@@ -1,7 +1,7 @@
 from silver2gold import *
 from config_aws import s3_client
 import tempfile
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import joblib
 
@@ -11,7 +11,6 @@ LIMIAR_Z = 3.0
 PISO_MAD = 0.5
 
 HORAS_JANELA = 24
-HORARIO_CONSOLIDACAO = 5
 MIN_EPISODIO = 5
 GAP_MINUTOS = 1
 
@@ -19,7 +18,7 @@ PREFIXO_CATEGORIZACAO = "03-gold/categorizacao/"
 PREFIXO_DASHBOARD = "03-gold/dashboard-categorica/"
 
 CHAVE_HISTORICO = PREFIXO_CATEGORIZACAO + "historico_episodios.json"
-CHAVE_CONSOLIDACAO = PREFIXO_DASHBOARD + "consolidacao_diaria.json"
+CHAVE_INTERPRETACAO_LATEST = PREFIXO_CATEGORIZACAO + "latest.json"
 CHAVE_DASHBOARD = PREFIXO_DASHBOARD + "dashboard.json"
 
 METRICAS_CATEGORIZACAO = [
@@ -32,6 +31,11 @@ METRICAS_CATEGORIZACAO = [
 ]
 
 COLUNAS_CONSTANTES = ["CPU_COUNT_LOGICA", "RAM_TOTAL", "DISCO_TOTAL"]
+COLUNAS_CARGA = list(dict.fromkeys(
+    COLUNAS + METRICAS_CATEGORIZACAO + COLUNAS_CONSTANTES
+))
+FUSO_TZ = ZoneInfo(FUSO)
+
 
 def buscar_todos():
     if os.getenv("HOSTNAMES"):
@@ -39,9 +43,11 @@ def buscar_todos():
         if not isinstance(hosts, list) or not hosts or not all(
                 isinstance(host, str) and host.strip() for host in hosts):
             raise ValueError("HOSTNAMES deve ser uma lista JSON com nomes de nodes.")
-        return sorted(set(hosts))
+        return [{"hpc_id": None, "hpc": None, "cluster_id": None,
+                 "cluster": None, "node_id": None, "hostname": host}
+                for host in sorted(set(hosts))]
 
-    import pymysql  
+    import pymysql
     conexao = pymysql.connect(
         host=os.environ["DB_HOST"], port=int(os.getenv("DB_PORT", "3306")),
         user=os.environ["DB_USER"], password=os.environ["DB_PASSWORD"],
@@ -49,9 +55,14 @@ def buscar_todos():
     try:
         with conexao.cursor() as cursor:
             cursor.execute('SELECT a.id_ambiente_hpc,a.nome,c.id_cluster,c.nome,n.id_node,n.hostname FROM ambiente_hpc AS a JOIN cluster AS c ON c.fk_ambiente_hpc = a.id_ambiente_hpc JOIN node AS n ON n.fk_cluster = c.id_cluster;')
-            return [r[0] for r in cursor.fetchall()]
+            return [
+                {"hpc_id": r[0], "hpc": r[1], "cluster_id": r[2],
+                 "cluster": r[3], "node_id": r[4], "hostname": r[5]}
+                for r in cursor.fetchall()
+            ]
     finally:
         conexao.close()
+
 
 def diretorio_cache():
     return os.path.join(
@@ -60,8 +71,9 @@ def diretorio_cache():
         MODELO_VERSAO,
     )
 
+
 def arquivos_modelo(nome):
-    diretorio = diretorio_cache
+    diretorio = diretorio_cache()
     os.makedirs(diretorio, exist_ok=True)
     caminho = os.path.join(diretorio, nome)
 
@@ -87,6 +99,7 @@ def arquivos_modelo(nome):
 
     return caminho
 
+
 def baixar_arquivos_modelo():
     caminho_modelo = arquivos_modelo("isolation_forest.joblib")
     caminho_baseline = arquivos_modelo("baseline.json")
@@ -100,6 +113,7 @@ def baixar_arquivos_modelo():
         raise ValueError("baseline.json inválido ou vazio.")
 
     return modelo, baseline
+
 
 def validar_compatibilidade(df, baseline):
     avisos = []
@@ -177,6 +191,7 @@ def validar_compatibilidade(df, baseline):
 
     return df.reset_index(drop=True), avisos
 
+
 def detectar_anomalias(df, modelo, colunas):
     df = df.copy()
 
@@ -185,14 +200,20 @@ def detectar_anomalias(df, modelo, colunas):
         df["score"] = pd.Series(dtype="float64")
         return df
 
-    matriz = df[list(colunas)]
+    matriz = df[list(colunas)].apply(pd.to_numeric, errors="coerce")
+    validas = matriz.notna().all(axis=1)
 
-    df["anomalia"] = modelo.predict(matriz)
-    df["score"] = modelo.decision_function(matriz)
+    df["anomalia"] = 1
+    df["score"] = 0.0
+
+    if validas.any():
+        df.loc[validas, "anomalia"] = modelo.predict(matriz[validas])
+        df.loc[validas, "score"] = modelo.decision_function(matriz[validas])
 
     return df
 
-def criar_episodio(hostname, registros, max_node):
+
+def criar_episodio(hostname, registros):
     if len(registros) < MIN_EPISODIO:
         return None
 
@@ -211,13 +232,10 @@ def criar_episodio(hostname, registros, max_node):
         "registros": registros.copy(),
     }
 
+
 def consolidar_episodios(df):
     if df.empty or "anomalia" not in df.columns:
         return []
-
-    max_por_node = (
-        df.groupby("HOSTNAME")["TIMESTAMP"].max().to_dict()
-    )
 
     episodios = []
 
@@ -229,7 +247,6 @@ def consolidar_episodios(df):
         if anomalos.empty:
             continue
 
-        max_node = max_por_node.get(hostname)
         inicio_bloco = 0
 
         for indice in range(1, len(anomalos)):
@@ -242,7 +259,6 @@ def consolidar_episodios(df):
                 episodio = criar_episodio(
                     hostname,
                     anomalos.iloc[inicio_bloco:indice],
-                    max_node
                 )
 
                 if episodio is not None:
@@ -253,7 +269,6 @@ def consolidar_episodios(df):
         episodio = criar_episodio(
             hostname,
             anomalos.iloc[inicio_bloco:],
-            max_node
         )
 
         if episodio is not None:
@@ -267,8 +282,10 @@ def consolidar_episodios(df):
         ),
     )
 
+
 def mad_interpretacao(metrica):
     return 1.0 if metrica == "LOAD_AVG_1" else PISO_MAD
+
 
 def calcular_zscores(registros, baseline_node):
     mediana_baseline = baseline_node.get("mediana", {})
@@ -438,6 +455,7 @@ def categorizar_episodio(zscores):
         "metricas_destaque": metricas_destaque,
     }
 
+
 def converter_num(valor):
     if valor is None:
         return None
@@ -451,6 +469,7 @@ def converter_num(valor):
         return None
 
     return round(numero, 2)
+
 
 def executar_interpretacao(df, modelo, colunas, baseline):
     df_validado, avisos = validar_compatibilidade(
@@ -483,6 +502,19 @@ def executar_interpretacao(df, modelo, colunas, baseline):
             zscores
         )
 
+        scores = pd.to_numeric(
+            episodio["registros"]["score"],
+            errors="coerce",
+        ).dropna()
+
+        score_max = float(scores.max()) if not scores.empty else None
+        score_medio = float(scores.mean()) if not scores.empty else None
+
+        if score_max is not None and not math.isfinite(score_max):
+            score_max = None
+        if score_medio is not None and not math.isfinite(score_medio):
+            score_medio = None
+
         metricas_destaque = [
             {
                 "metrica": item["metrica"],
@@ -513,6 +545,8 @@ def executar_interpretacao(df, modelo, colunas, baseline):
                     "codigo": int(categoria["codigo"]),
                     "nome": categoria["nome"],
                 },
+                "score": score_max,
+                "score_medio": score_medio,
                 "severidade_z": converter_num(
                     categoria["severidade_z"]
                 ),
@@ -533,7 +567,7 @@ def executar_interpretacao(df, modelo, colunas, baseline):
         "schema_version": "2.0",
         "metadados": {
             "gerado_em": datetime.now(
-                FUSO
+                FUSO_TZ
             ).isoformat(),
             "modelo_versao": MODELO_VERSAO,
             "janela_horas": int(HORAS_JANELA),
@@ -546,6 +580,7 @@ def executar_interpretacao(df, modelo, colunas, baseline):
         },
         "episodios": episodios_json,
     }
+
 
 def mesclar_episodios(historico, novos):
     resultado = list(historico)
@@ -603,6 +638,18 @@ def mesclar_episodios(historico, novos):
             fim_novo,
         )
 
+        scores = [
+            valor
+            for valor in (existente.get("score"), novo.get("score"))
+            if valor is not None
+        ]
+
+        scores_medios = [
+            valor
+            for valor in (existente.get("score_medio"), novo.get("score_medio"))
+            if valor is not None
+        ]
+
         resultado[correspondencia] = {
             **existente,
             **novo,
@@ -618,6 +665,8 @@ def mesclar_episodios(historico, novos):
                 existente["quantidade_registros_anomalos"],
                 novo["quantidade_registros_anomalos"],
             ),
+            "score": max(scores) if scores else None,
+            "score_medio": max(scores_medios) if scores_medios else None,
         }
 
     resultado.sort(
@@ -629,47 +678,87 @@ def mesclar_episodios(historico, novos):
 
     return resultado
 
-def ler_json(chave, padrao):
-    from config_aws import s3_client
 
+def ler_json_com_etag(chave, padrao):
     try:
         resposta = s3_client.get_object(
-            Bucket=os.getenv('BUCKET_NAME'),
+            Bucket=os.getenv("BUCKET_NAME"),
             Key=chave,
         )
 
-        conteudo = resposta["Body"].read().decode("utf-8")
-        return json.loads(conteudo)
+        try:
+            conteudo = resposta["Body"].read().decode("utf-8")
+            return json.loads(conteudo), resposta.get("ETag")
+        finally:
+            resposta["Body"].close()
 
     except ClientError as erro:
         codigo = erro.response.get("Error", {}).get("Code")
 
         if codigo in ("NoSuchKey", "404", "NotFound"):
-            return padrao
+            return padrao, None
 
         raise
 
+
+def ler_json(chave, padrao):
+    return ler_json_com_etag(chave, padrao)[0]
+
+
+def podar_historico(historico, referencia):
+    limite = referencia - timedelta(hours=HORAS_JANELA)
+    podados = []
+
+    for episodio in historico:
+        fim = instante(episodio.get("fim"))
+
+        if not pd.isna(fim) and fim >= limite:
+            podados.append(episodio)
+
+    return podados
+
+
 def atualizar_historico_interpretacao(novos):
-    historico = ler_json(
-        CHAVE_HISTORICO,
-        [],
-    )
+    fins = [
+        instante(episodio["fim"])
+        for episodio in novos
+    ]
+    fins = [fim for fim in fins if not pd.isna(fim)]
+    referencia = max(fins) if fins else pd.Timestamp.now(tz=FUSO)
 
-    if not isinstance(historico, list):
-        raise ValueError("Histórico de episódios inválido.")
+    bucket = os.getenv("BUCKET_NAME")
 
-    atualizado = mesclar_episodios(
-        historico,
-        novos,
-    )
+    for _ in range(3):
+        historico, etag = ler_json_com_etag(
+            CHAVE_HISTORICO,
+            [],
+        )
 
-    gravar(
-        os.getenv('BUCKET_NAME'),
-        CHAVE_HISTORICO,
-        atualizado,
-    )
+        if not isinstance(historico, list):
+            raise ValueError("Histórico de episódios inválido.")
 
-    return atualizado
+        atualizado = mesclar_episodios(
+            podar_historico(historico, referencia),
+            novos,
+        )
+
+        opcoes = {"IfMatch": etag} if etag else {"IfNoneMatch": "*"}
+
+        try:
+            gravar(
+                s3_client,
+                bucket,
+                CHAVE_HISTORICO,
+                atualizado,
+                **opcoes,
+            )
+            return atualizado
+        except ClientError as erro:
+            if erro.response["Error"]["Code"] not in ("PreconditionFailed", "412"):
+                raise
+
+    raise RuntimeError("Não foi possível atualizar o histórico de episódios.")
+
 
 def agregar_categorias(historico):
     contagem = {}
@@ -692,6 +781,7 @@ def agregar_categorias(historico):
         )
     ]
 
+
 def agregar_nodes(historico):
     contagem = {}
 
@@ -713,12 +803,80 @@ def agregar_nodes(historico):
         )
     ]
 
-def dados_dash(historico, consolidacao):
+
+def agregar_scores(historico):
+    agrupado = {}
+
+    for episodio in historico:
+        nome = episodio["categoria"]["nome"]
+        score = episodio.get("score")
+
+        if score is None:
+            continue
+
+        agrupado.setdefault(nome, []).append(float(score))
+
+    return [
+        {
+            "nome": nome,
+            "score_max": max(valores),
+            "score_medio": sum(valores) / len(valores),
+        }
+        for nome, valores in sorted(
+            agrupado.items(),
+            key=lambda item: (-max(item[1]), item[0]),
+        )
+    ]
+
+
+def agregar_matriz(historico):
+    matriz = {}
+
+    for episodio in historico:
+        categoria = episodio["categoria"]["nome"]
+        hostname = episodio["hostname"]
+        linha = matriz.setdefault(categoria, {})
+        linha[hostname] = linha.get(hostname, 0) + 1
+
+    return matriz
+
+
+def agregar_filtros(nos):
+    hpc = {}
+    cluster = {}
+
+    for no in nos or []:
+        if no.get("hpc_id") is not None:
+            hpc.setdefault(no["hpc_id"], no.get("hpc"))
+        if no.get("cluster_id") is not None:
+            cluster.setdefault(no["cluster_id"], no.get("cluster"))
+
+    return {
+        "hpc": [
+            {"id": chave, "nome": nome}
+            for chave, nome in sorted(hpc.items())
+        ],
+        "cluster": [
+            {"id": chave, "nome": nome}
+            for chave, nome in sorted(cluster.items())
+        ],
+    }
+
+
+def dados_dash(historico, nos=None):
     categorias = agregar_categorias(
         historico
     )
 
     nodes = agregar_nodes(
+        historico
+    )
+
+    scores = agregar_scores(
+        historico
+    )
+
+    matriz = agregar_matriz(
         historico
     )
 
@@ -736,36 +894,21 @@ def dados_dash(historico, consolidacao):
         else None
     )
 
-    data_cards = consolidacao.get(
-        "ultima_data_processada"
-    )
-
-    cards_diarios = (
-        consolidacao.get("dias", {}).get(
-            data_cards,
-            {
-                "data_referencia": data_cards,
-                "atualizado_em": None,
-                "total_episodios": 0,
-                "nodes": [],
-            },
-        )
-        if data_cards
-        else {
-            "data_referencia": None,
-            "atualizado_em": None,
-            "total_episodios": 0,
-            "nodes": [],
-        }
+    categoria_mais_severa = (
+        scores[0]
+        if scores
+        else None
     )
 
     return {
         "schema_version": "2.0",
         "metadados": {
             "gerado_em": datetime.now(
-                FUSO
+                FUSO_TZ
             ).isoformat(),
-            "fuso_horario": "America/Sao_Paulo",
+            "fuso_horario": FUSO,
+            "janela_horas": HORAS_JANELA,
+            "modelo_versao": MODELO_VERSAO,
             "total_episodios_historicos": total_episodios,
             "total_nodes": len(nodes),
             "total_categorias": len(categorias),
@@ -773,49 +916,90 @@ def dados_dash(historico, consolidacao):
         "indicadores": {
             "node_mais_problematico": node_mais_problematico,
             "categoria_mais_comum": categoria_mais_comum,
+            "categoria_mais_severa": categoria_mais_severa,
             "total_episodios": total_episodios,
         },
         "categorias": categorias,
         "nodes": nodes,
-        "consolidacao_diaria": cards_diarios,
+        "matriz_categoria_node": matriz,
+        "filtros": agregar_filtros(nos),
+        "episodios": historico,
     }
 
+
 def processar_categorizacao():
-    modelo, baseline = baixar_arquivos_modelo
+    modelo, baseline = baixar_arquivos_modelo()
 
-    hosts = buscar_todos()
+    nos = buscar_todos()
+    hosts = [no["hostname"] for no in nos]
+    mapa_nos = {no["hostname"]: no for no in nos}
+
+    bucket = os.getenv("BUCKET_NAME")
+    if not bucket:
+        raise ValueError("A variável BUCKET_NAME não foi configurada.")
+
     agora = pd.Timestamp.now(tz=FUSO)
+    inicio = agora - timedelta(hours=HORAS_JANELA)
+    bucket_silver = os.getenv("SILVER_BUCKET_NAME", bucket)
 
-    df = carregar_silver(os.getenv('BUCKET_NAME'), os.getenv('SILVER_BUCKET_NAME'), hosts, agora)
+    df = carregar_silver(
+        s3_client,
+        bucket_silver,
+        hosts,
+        agora,
+        inicio=inicio,
+        colunas=COLUNAS_CARGA,
+    )
 
     relatorio = executar_interpretacao(
         df,
         modelo,
+        METRICAS_CATEGORIZACAO,
         baseline,
     )
+
+    for episodio in relatorio["episodios"]:
+        no = mapa_nos.get(episodio["hostname"], {})
+        episodio.update({
+            "hpc_id": no.get("hpc_id"),
+            "hpc": no.get("hpc"),
+            "cluster_id": no.get("cluster_id"),
+            "cluster": no.get("cluster"),
+            "node_id": no.get("node_id"),
+        })
 
     historico = atualizar_historico_interpretacao(
         relatorio["episodios"]
     )
 
     dashboard = dados_dash(
-        historico
+        historico,
+        nos,
     )
 
     gravar(
+        s3_client,
+        bucket,
         CHAVE_INTERPRETACAO_LATEST,
         relatorio,
     )
 
     gravar(
+        s3_client,
+        bucket,
         CHAVE_DASHBOARD,
         dashboard,
     )
 
-    metadados = relatorio["metadados"]
     return dashboard
 
 
-CHAVE_INTERPRETACAO_LATEST = (
-    PREFIXO_CATEGORIZACAO + "latest.json"
-)
+def lambda_handler(event, context):
+    if not os.getenv("BUCKET_NAME"):
+        raise ValueError("Configure a variável BUCKET_NAME na Lambda.")
+
+    return processar_categorizacao()
+
+
+if __name__ == "__main__":
+    processar_categorizacao()
