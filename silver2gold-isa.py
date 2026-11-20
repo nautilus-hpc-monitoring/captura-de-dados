@@ -175,3 +175,18 @@ def validar_compatibilidade(df, baseline):
                 )
 
     return df.reset_index(drop=True), avisos
+
+def detectar_anomalias(df, modelo, colunas):
+    df = df.copy()
+
+    if df.empty:
+        df["anomalia"] = pd.Series(dtype="int64")
+        df["score"] = pd.Series(dtype="float64")
+        return df
+
+    matriz = df[list(colunas)]
+
+    df["anomalia"] = modelo.predict(matriz)
+    df["score"] = modelo.decision_function(matriz)
+
+    return df
