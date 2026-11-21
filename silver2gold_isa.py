@@ -115,6 +115,16 @@ def baixar_arquivos_modelo():
     return modelo, baseline
 
 
+def colunas_modelo():
+    caminho = arquivos_modelo("colunas.json")
+    with open(caminho, "r", encoding="utf-8") as arquivo:
+        colunas = json.load(arquivo)
+    if (not isinstance(colunas, list) or not colunas
+            or not all(isinstance(coluna, str) and coluna.strip() for coluna in colunas)):
+        raise ValueError("colunas.json inválido ou vazio.")
+    return colunas
+
+
 def validar_compatibilidade(df, baseline):
     avisos = []
 
@@ -200,7 +210,11 @@ def detectar_anomalias(df, modelo, colunas):
         df["score"] = pd.Series(dtype="float64")
         return df
 
-    matriz = df[list(colunas)].apply(pd.to_numeric, errors="coerce")
+    features = [str(coluna) for coluna in getattr(modelo, "feature_names_in_", colunas)]
+    faltantes = [coluna for coluna in features if coluna not in df.columns]
+    if faltantes:
+        raise ValueError(f"Colunas ausentes para o modelo: {faltantes}")
+    matriz = df[features].apply(pd.to_numeric, errors="coerce")
     validas = matriz.notna().all(axis=1)
 
     df["anomalia"] = 1
@@ -929,6 +943,7 @@ def dados_dash(historico, nos=None):
 
 def processar_categorizacao():
     modelo, baseline = baixar_arquivos_modelo()
+    features = colunas_modelo()
 
     nos = buscar_todos()
     hosts = [no["hostname"] for no in nos]
@@ -948,13 +963,13 @@ def processar_categorizacao():
         hosts,
         agora,
         inicio=inicio,
-        colunas=COLUNAS_CARGA,
+        colunas=features,
     )
 
     relatorio = executar_interpretacao(
         df,
         modelo,
-        METRICAS_CATEGORIZACAO,
+        features,
         baseline,
     )
 
