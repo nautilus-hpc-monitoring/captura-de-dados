@@ -429,3 +429,7 @@ FodyWeavers.xsd
 *.msp
 
 *.csv
+
+# Dados locais usados só nos testes da ETL do analista (não versionar).
+silver_local/
+gold_local/
