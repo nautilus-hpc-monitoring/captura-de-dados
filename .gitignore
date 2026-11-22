@@ -3,6 +3,8 @@
 ##
 ## Get latest from https://github.com/github/gitignore/blob/main/VisualStudio.gitignore
 
+silver2gold_isa_teste.py
+
 # User-specific files
 *.rsuser
 *.suo
