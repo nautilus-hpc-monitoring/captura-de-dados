@@ -11,15 +11,16 @@ MAPA DO ARQUIVO
 4. Gráfico 1: ocupação de disco real e prevista.
 5. Gráfico 2: mapa de calor de CPU e RAM.
 6. Gráfico 3: consumo real e referência das duas semanas anteriores.
-7. KPI: médias dos componentes desde segunda-feira.
-8. Execução da ETL João.
-9. ETL Isa: modelo, Silver, anomalias e episódios.
-10. ETL Isa: categorias, histórico e consolidação diária.
-11. ETL Isa: relatório e dashboard categórica.
-12. Execução conjunta e entrada da Lambda.
+7. Gráfico 5: leituras de RAM e ocupação da swap.
+8. KPI: médias dos componentes desde segunda-feira.
+9. Execução da ETL João.
+10. ETL Isa: modelo, Silver, anomalias e episódios.
+11. ETL Isa: categorias, histórico e consolidação diária.
+12. ETL Isa: relatório e dashboard categórica.
+13. Execução conjunta e entrada da Lambda.
 
 A captura continua em local2bronze.py; não é feita por esta ETL.
-As KPIs de alertas e SLA são calculadas pelo site usando o MySQL.
+Alertas, SLA e gráfico 4 são calculados pelo site usando o MySQL.
 Local: python silver2gold.py. Lambda: silver2gold.lambda_handler.
 Na Lambda compartilhada use ETL_MODULO=silver2gold.
 """
@@ -45,8 +46,8 @@ SILVER = os.getenv("SILVER_PREFIX", "02-silver/")
 GOLD = os.getenv("CLUSTER_GOLD_PREFIX", "03-gold/gestor").rstrip("/")
 PASSO = int(os.getenv("COLETA_SEGUNDOS", "10"))
 COBERTURA = float(os.getenv("COBERTURA_MINIMA", "0.8"))
-# A swap permanece na média semanal da KPI, sem gerar um gráfico próprio.
-COLUNAS = ["CPU_PERCENT", "RAM_PERCENT", "SWAP_USED", "SWAP_FREE",
+COLUNAS = ["CPU_PERCENT", "RAM_PERCENT", "RAM_TOTAL", "RAM_AVAILABLE",
+           "SWAP_PERCENT", "SWAP_USED", "SWAP_FREE", "SWAP_IN", "SWAP_OUT",
            "DISCO_TOTAL", "DISCO_USED"]
 
 
@@ -114,6 +115,8 @@ def carregar_silver(s3, bucket, hosts, agora):
                                 df[c] = df[c].where(df[c] <= 100)
                         df["DISCO_USED"] = df["DISCO_USED"].where(
                             (df["DISCO_TOTAL"] > 0) & (df["DISCO_USED"] <= df["DISCO_TOTAL"]))
+                        df["RAM_AVAILABLE"] = df["RAM_AVAILABLE"].where(
+                            (df["RAM_TOTAL"] > 0) & (df["RAM_AVAILABLE"] <= df["RAM_TOTAL"]))
                         partes.append(df[["HOSTNAME", "TIMESTAMP"] + COLUNAS])
             finally:
                 corpo.close()
@@ -238,7 +241,26 @@ def consumo(horas, hoje, corte, previsao=None):
             "ramObserved": real["RAM_PERCENT"].tolist(), **previsao}
 
 
-# ETL JOÃO — 7. KPI 2: média de cada componente desde segunda até a última coleta.
+# ETL JOÃO — 7. GRÁFICO 5: RAM e ocupação da swap, disponíveis também no Windows.
+def memoria(g, corte):
+    janela = g[g["TIMESTAMP"].between(corte - pd.Timedelta(hours=24), corte)].copy()
+    if len(janela) < 2:
+        return None
+    total_swap = janela["SWAP_USED"] + janela["SWAP_FREE"]
+    if not total_swap.notna().any():
+        return None
+    sem_swap = bool((total_swap.dropna() == 0).all())
+    disponivel = janela["RAM_AVAILABLE"] / janela["RAM_TOTAL"] * 100
+    percentual_swap = janela["SWAP_USED"] / total_swap.where(total_swap > 0) * 100
+    percentual_swap = percentual_swap.where(percentual_swap.between(0, 100))
+    return {"semSwap": sem_swap, "leituras": [
+        {"timestamp": r.TIMESTAMP.isoformat(), "ramDisponivel": disponivel.loc[i],
+         "swapPercent": percentual_swap.loc[i],
+         "swapIn": r.SWAP_IN, "swapOut": r.SWAP_OUT}
+        for i, r in janela.iterrows()]}
+
+
+# ETL JOÃO — 8. KPI 2: média de cada componente desde segunda até a última coleta.
 # Cada intervalo de coleta tem o mesmo peso; valores ausentes não viram zero.
 def medias_semana(g, semana, corte):
     janela = g[g["TIMESTAMP"].between(semana, corte)].copy()
@@ -261,7 +283,7 @@ def medias_semana(g, semana, corte):
     })
 
 
-# ETL JOÃO — 8. EXECUÇÃO: publica somente o contrato consumido pela dashboard atual.
+# ETL JOÃO — 9. EXECUÇÃO: publica somente o contrato consumido pela dashboard atual.
 def executar():
     if not 0 < PASSO <= 300 or 3600 % PASSO or not 0 < COBERTURA <= 1:
         raise ValueError("COLETA_SEGUNDOS deve dividir 3600; cobertura deve estar entre 0 e 1.")
@@ -295,7 +317,7 @@ def executar():
         prev_consumo = congelar(s3, bucket, chave_consumo, lambda: consumo(horas, hoje, corte))
         nodes.append({"hostname": host, "disco": disco(g, semana, corte, prev_disco) if prev_disco else None,
                       "calor": calor(horas, hoje), "consumo": consumo(horas, hoje, corte, prev_consumo),
-                      "medias_semana": medias_semana(g, semana, corte)})
+                      "memoria": memoria(g, corte), "medias_semana": medias_semana(g, semana, corte)})
     painel = {"schema_version": 2,
               "metadados": {"cluster_id": cluster_id, "gerado_em": agora,
                             "telemetria_ate": df["TIMESTAMP"].max(), "demonstrativo": False},
@@ -311,6 +333,21 @@ def validar_configuracao_gestor():
     for variavel in ("BUCKET_NAME", "GESTOR_CLUSTER_ID", "HOSTNAMES", "DISCO_VOLUME"):
         if not os.getenv(variavel):
             raise ValueError(f"Configure a variável {variavel} na Lambda.")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 # ============================================================
@@ -471,7 +508,6 @@ def _gravar_json_s3_interpretacao(chave, dados):
         Body=conteudo,
         ContentType="application/json; charset=utf-8",
     )
-
 
 # ETL ISA — SILVER — mantém a leitura e a janela de dados originais.
 def carregar_dados_silver_interpretacao(colunas):
