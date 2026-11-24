@@ -5,16 +5,17 @@ MAPA DO ARQUIVO
 2. Leitura da Silver: validação, filtro de datas e remoção de duplicatas.
 3. Publicação JSON e reutilização das previsões do período.
 4. Gráfico 1: ocupação de disco real e prevista.
-5. Gráfico 2: mapa de calor de CPU e RAM.
+5. Gráfico 2: mapa de calor de CPU, RAM, Disco e Swap.
 6. Gráfico 3: consumo real e referência das duas semanas anteriores.
 7. Gráfico 5: leituras de RAM e contadores de swap disponíveis.
-8. KPI: médias dos componentes desde segunda-feira.
+8. KPI: médias dos componentes desde segunda-feira e campeões do operador.
 9. Execução e entrada da Lambda.
 
 A captura continua em local2bronze.py; não é feita por esta ETL.
 Alertas, SLA e gráfico 4 são calculados pelo site usando o MySQL.
 Gestor: python silver2gold.py ou silver2gold.lambda_handler na Lambda.
 Analista: MODO_LOCAL=1 no teste local ou silver2gold.lambda_handler_analista na Lambda.
+Operador: silver2gold.lambda_handler_operador na Lambda (HOSTNAMES ou OPERADOR_EMPRESA_ID).
 """
 import io
 import json
@@ -42,6 +43,11 @@ COBERTURA = float(os.getenv("COBERTURA_MINIMA", "0.8"))
 COLUNAS = ["CPU_PERCENT", "RAM_PERCENT", "RAM_TOTAL", "RAM_AVAILABLE",
            "SWAP_PERCENT", "SWAP_USED", "SWAP_FREE", "SWAP_IN", "SWAP_OUT",
            "DISCO_TOTAL", "DISCO_USED"]
+OPERADOR_GOLD_PREFIX = os.getenv("OPERADOR_GOLD_PREFIX", "03-gold/operador").rstrip("/")
+OPERADOR_CLUSTER_ID = int(os.getenv("OPERADOR_CLUSTER_ID", "0"))
+OPERADOR_LIMITE_ATENCAO = float(os.getenv("OPERADOR_LIMITE_ATENCAO", "75"))
+OPERADOR_LIMITE_CRITICO = float(os.getenv("OPERADOR_LIMITE_CRITICO", "90"))
+OPERADOR_COLUNAS = list(COLUNAS) + ["DISCO_PERCENT"]
 
 
 # 1. CADASTRO: nodes informados na configuração ou consultados no banco.
@@ -66,6 +72,72 @@ def buscar_hosts(cluster_id):
             return [r[0] for r in cursor.fetchall()]
     finally:
         conexao.close()
+
+
+def buscar_hosts_operador():
+    if os.getenv("HOSTNAMES"):
+        hosts = json.loads(os.environ["HOSTNAMES"])
+        if not isinstance(hosts, list) or not hosts or not all(
+                isinstance(host, str) and host.strip() for host in hosts):
+            raise ValueError("HOSTNAMES deve ser uma lista JSON com nomes de nodes.")
+        return {
+            host.strip(): {
+                "hostname": host.strip(),
+                "id_cluster": OPERADOR_CLUSTER_ID,
+                "id_ambiente_hpc": None,
+                "id_node": None,
+                "limites": {}
+            }
+            for host in hosts
+        }
+
+    empresa = os.getenv("OPERADOR_EMPRESA_ID")
+    if not empresa:
+        raise ValueError("Configure OPERADOR_EMPRESA_ID ou HOSTNAMES.")
+    try:
+        empresa_id = int(empresa)
+    except ValueError as erro:
+        raise ValueError("OPERADOR_EMPRESA_ID deve ser um número inteiro.") from erro
+
+    import pymysql
+    conexao = pymysql.connect(
+        host=os.environ["DB_HOST"], port=int(os.getenv("DB_PORT", "3306")),
+        user=os.environ["DB_USER"], password=os.environ["DB_PASSWORD"],
+        database=os.environ["DB_DATABASE"], charset="utf8mb4")
+    try:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                "SELECT h.id_ambiente_hpc, c.id_cluster, n.id_node, n.hostname, "
+                "co.tipo, cn.limite_atencao, cn.limite_critico, cn.pico_min, cn.pico_max "
+                "FROM ambiente_hpc h "
+                "JOIN cluster c ON c.fk_ambiente_hpc = h.id_ambiente_hpc "
+                "JOIN node n ON n.fk_cluster = c.id_cluster "
+                "LEFT JOIN componente_node cn ON cn.fk_node = n.id_node "
+                "LEFT JOIN componente co ON co.id_componente = cn.fk_componente "
+                "WHERE h.fk_empresa = %s ORDER BY c.id_cluster, n.hostname",
+                (empresa_id,))
+            linhas = cursor.fetchall()
+    finally:
+        conexao.close()
+
+    catalogo = {}
+    for linha in linhas:
+        id_hpc, id_cluster, id_node, hostname, tipo, atencao, critico, pico_min, pico_max = linha
+        registro = catalogo.setdefault(hostname, {
+            "hostname": hostname,
+            "id_cluster": int(id_cluster),
+            "id_ambiente_hpc": int(id_hpc),
+            "id_node": int(id_node),
+            "limites": {}
+        })
+        if tipo:
+            registro["limites"][str(tipo).strip().upper()] = {
+                "limite_atencao": atencao,
+                "limite_critico": critico,
+                "pico_min": pico_min,
+                "pico_max": pico_max
+            }
+    return catalogo
 
 
 # 2. SILVER: limpeza e filtro antes de juntar os arquivos na memória.
@@ -251,6 +323,84 @@ def medias_semana(g, semana, corte):
     })
 
 
+def numero_limite(valor, padrao):
+    try:
+        numero = float(valor)
+    except (TypeError, ValueError):
+        return padrao
+    return numero if math.isfinite(numero) and 0 <= numero <= 100 else padrao
+
+
+def calor_com_componentes(g, hoje):
+    dados = g.copy()
+    if "DISCO_PERCENT" in dados.columns:
+        disco_percentual = dados["DISCO_PERCENT"]
+    else:
+        disco_percentual = dados["DISCO_USED"] / dados["DISCO_TOTAL"].where(
+            dados["DISCO_TOTAL"] > 0) * 100
+    dados["Disco"] = disco_percentual
+    dados["Swap"] = dados["SWAP_PERCENT"]
+    detalhe = dados.set_index("TIMESTAMP")[["CPU_PERCENT", "RAM_PERCENT", "Disco", "Swap"]]
+    detalhe = detalhe.resample(f"{PASSO}s").mean().resample("1h").mean()
+    dias = pd.date_range(hoje - pd.Timedelta(days=7), periods=7, freq="D")
+    linhas = []
+    for dia in dias:
+        faixa = detalhe.reindex(pd.date_range(dia, periods=24, freq="1h"))
+        linhas.append([
+            {"CPU": registro.CPU_PERCENT, "RAM": registro.RAM_PERCENT,
+             "Disco": registro.Disco, "Swap": registro.Swap}
+            for registro in faixa.itertuples()
+        ])
+    return {"dias": [dia.date().isoformat() for dia in dias], "leituras": linhas}
+
+
+def montar_kpis_operador(resumo, limites=None):
+    limites = limites or {}
+    valores = (resumo or {}).get("valores") or {}
+    kpis = {}
+    for chave, coluna in (("CPU", "CPU"), ("RAM", "RAM"),
+                          ("DISCO", "Disco"), ("SWAP", "Swap")):
+        try:
+            valor = float(valores.get(coluna))
+        except (TypeError, ValueError):
+            valor = float("nan")
+        if not math.isfinite(valor) or not 0 <= valor <= 100:
+            kpis[chave] = {"valor": None, "status": "sem_dados"}
+            continue
+        numero = round(valor, 1)
+        limite = limites.get(coluna.upper()) or {}
+        atencao = numero_limite(limite.get("limite_atencao"), OPERADOR_LIMITE_ATENCAO)
+        critico = numero_limite(limite.get("limite_critico"), OPERADOR_LIMITE_CRITICO)
+        if critico <= atencao:
+            atencao = OPERADOR_LIMITE_ATENCAO
+            critico = OPERADOR_LIMITE_CRITICO
+        status = "critico" if numero >= critico else "atencao" if numero >= atencao else "normal"
+        kpis[chave] = {"valor": numero, "status": status}
+    return kpis
+
+
+def montar_no_operador(s3, bucket, g, host, cluster_id, limites, agora, hoje, semana):
+    corte = min(agora, g["TIMESTAMP"].max())
+    horas = medias_horarias(g)
+    caminho_host = quote(host, safe="")
+    chave_disco = f"{GOLD}/cluster={cluster_id}/previsoes-v2/disco/{semana.date()}/{caminho_host}.json"
+    chave_consumo = f"{GOLD}/cluster={cluster_id}/previsoes-v2/consumo/{hoje.date()}/{caminho_host}.json"
+    prev_disco = congelar(s3, bucket, chave_disco, lambda: disco(g, semana, corte))
+    prev_consumo = congelar(s3, bucket, chave_consumo, lambda: consumo(horas, hoje, corte))
+    resumo = medias_semana(g, semana, corte)
+    return {
+        "hostname": host,
+        "cluster_id": cluster_id,
+        "disco": disco(g, semana, corte, prev_disco) if prev_disco else None,
+        "calor": calor_com_componentes(g, hoje),
+        "consumo": consumo(horas, hoje, corte, prev_consumo),
+        "memoria": memoria(g, corte),
+        "medias_semana": resumo,
+        "picos": None,
+        "kpis": montar_kpis_operador(resumo, limites)
+    }
+
+
 # 9. EXECUÇÃO: publica somente o contrato consumido pela dashboard atual.
 def executar():
     if not 0 < PASSO <= 300 or 3600 % PASSO or not 0 < COBERTURA <= 1:
@@ -275,19 +425,11 @@ def executar():
     for host in hosts:
         g = df[df["HOSTNAME"] == host].copy()
         if g.empty:
-            continue  # O cadastro do banco continua exibindo esse node como sem telemetria.
-        corte = min(agora, g["TIMESTAMP"].max())
-        horas = medias_horarias(g)
-        caminho_host = quote(host, safe="")
-        chave_disco = f"{base}/previsoes-v2/disco/{semana.date()}/{caminho_host}.json"
-        chave_consumo = f"{base}/previsoes-v2/consumo/{hoje.date()}/{caminho_host}.json"
-        prev_disco = congelar(s3, bucket, chave_disco, lambda: disco(g, semana, corte))
-        prev_consumo = congelar(s3, bucket, chave_consumo, lambda: consumo(horas, hoje, corte))
-        nodes.append({"hostname": host, "disco": disco(g, semana, corte, prev_disco) if prev_disco else None,
-                      "calor": calor(horas, hoje), "consumo": consumo(horas, hoje, corte, prev_consumo),
-                      "memoria": memoria(g, corte), "medias_semana": medias_semana(g, semana, corte)})
+            continue
+        nodes.append(montar_no_operador(s3, bucket, g, host, cluster_id, {}, agora, hoje, semana))
     painel = {"schema_version": 2,
               "metadados": {"cluster_id": cluster_id, "gerado_em": agora,
+                            "gerado_em_utc": agora.tz_convert("UTC").isoformat(),
                             "telemetria_ate": df["TIMESTAMP"].max(), "demonstrativo": False},
               "nodes": nodes}
     chave = f"{base}/dashboard.json"
@@ -2501,6 +2643,94 @@ def lambda_handler_analista(event, context):
         raise ValueError("Configure HOSTNAMES (ou as variáveis do MySQL).")
 
     return executar_analista()
+
+
+def executar_operador():
+    if not 0 < PASSO <= 300 or 3600 % PASSO or not 0 < COBERTURA <= 1:
+        raise ValueError("COLETA_SEGUNDOS deve dividir 3600; cobertura deve estar entre 0 e 1.")
+    if not 0 <= OPERADOR_LIMITE_ATENCAO < OPERADOR_LIMITE_CRITICO <= 100:
+        raise ValueError("OPERADOR_LIMITE_ATENCAO deve ser menor que OPERADOR_LIMITE_CRITICO.")
+    if not os.getenv("DISCO_VOLUME"):
+        raise ValueError("Configure a variável DISCO_VOLUME.")
+
+    catalogo = buscar_hosts_operador()
+    if not catalogo:
+        raise ValueError("Nenhum node cadastrado para a empresa informada.")
+
+    bucket = os.environ["BUCKET_NAME"]
+    s3 = boto3.client("s3", region_name=os.getenv("AWS_REGION", os.getenv("REGION_NAME", "us-east-1")))
+    agora = pd.Timestamp.now(tz=FUSO)
+    bucket_silver = os.getenv("SILVER_BUCKET_NAME", bucket)
+    hosts = sorted(catalogo)
+    df = carregar_silver(s3, bucket_silver, hosts, agora,
+                         inicio=agora - pd.Timedelta(days=45), colunas=OPERADOR_COLUNAS)
+    if df.empty:
+        raise ValueError("Silver sem leituras válidas no período; publicação cancelada.")
+
+    hoje = agora.normalize()
+    semana = hoje - pd.Timedelta(days=hoje.dayofweek)
+    todos = []
+    por_cluster = {}
+    for host in hosts:
+        informacao = catalogo[host]
+        g = df[df["HOSTNAME"] == host].copy()
+        if g.empty:
+            continue
+        no = montar_no_operador(s3, bucket, g, host, informacao["id_cluster"],
+                                informacao["limites"], agora, hoje, semana)
+        todos.append(no)
+        por_cluster.setdefault(informacao["id_cluster"], []).append(no)
+
+    if not todos:
+        raise ValueError("Nenhum node com telemetria válida na Silver.")
+
+    empresa = os.getenv("OPERADOR_EMPRESA_ID")
+    metadados = {
+        "gerado_em": agora,
+        "gerado_em_utc": agora.tz_convert("UTC").isoformat(),
+        "telemetria_ate": df["TIMESTAMP"].max(),
+        "demonstrativo": False,
+        "origem": SILVER,
+        "empresa_id": int(empresa) if empresa and empresa.isdigit() else None,
+    }
+
+    chaves = []
+    for cluster_id, nodes in sorted(por_cluster.items()):
+        if cluster_id <= 0:
+            continue
+        painel = {"schema_version": 2,
+                  "metadados": {**metadados, "cluster_id": cluster_id},
+                  "nodes": nodes}
+        chave = f"{GOLD}/cluster={cluster_id}/dashboard.json"
+        gravar(s3, bucket, chave, painel)
+        chaves.append(chave)
+
+    consolidado = {
+        "schema_version": 2,
+        "metadados": {**metadados, "cluster_id": 0, "clusters": sorted(por_cluster)},
+        "nodes": todos,
+        "avisos": []
+    }
+    chave_unica = f"{OPERADOR_GOLD_PREFIX}/dashboard.json"
+    gravar(s3, bucket, chave_unica, consolidado)
+    chaves.append(chave_unica)
+
+    print(f"Gold publicada: s3://{bucket}/{chave_unica} | {len(todos)} nodes em {len(chaves)} chaves")
+    return {"chaves": [f"s3://{bucket}/{chave}" for chave in chaves],
+            "nodes": len(todos), "clusters": len(por_cluster)}
+
+
+def lambda_handler_operador(event, context):
+    for variavel in ("BUCKET_NAME", "DISCO_VOLUME"):
+        if not os.getenv(variavel):
+            raise ValueError(f"Configure a variável {variavel} na Lambda.")
+    if not os.getenv("HOSTNAMES") and not os.getenv("OPERADOR_EMPRESA_ID"):
+        raise ValueError("Configure HOSTNAMES ou OPERADOR_EMPRESA_ID na Lambda.")
+    if not os.getenv("HOSTNAMES"):
+        for variavel in ("DB_HOST", "DB_USER", "DB_PASSWORD", "DB_DATABASE"):
+            if not os.getenv(variavel):
+                raise ValueError(f"Configure a variável {variavel} na Lambda.")
+    return executar_operador()
 
 
 # Este bloco só roda quando o arquivo é executado direto (python arquivo.py).
