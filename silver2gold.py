@@ -165,13 +165,11 @@ def congelar(s3, bucket, chave, calcular):
         return ler()
 
 
-# 3. BASE HORÁRIA: mínimo de cobertura e um valor por intervalo de coleta.
+# 3. BASE HORÁRIA: média por hora com as amostras disponíveis.
 def medias_horarias(g):
     colunas = ["CPU_PERCENT", "RAM_PERCENT"]
     amostras = g.set_index("TIMESTAMP")[colunas].resample(f"{PASSO}s").mean()
-    media = amostras.resample("1h").mean()
-    contagem = amostras.resample("1h").count()
-    return media.where(contagem >= math.ceil(3600 / PASSO * COBERTURA))
+    return amostras.resample("1h").mean()
 
 
 # 4. GRÁFICO 1: último disco do dia e regressão dos 30 dias anteriores à semana.
