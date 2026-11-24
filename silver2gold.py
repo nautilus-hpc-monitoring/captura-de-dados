@@ -1620,15 +1620,14 @@ def acumular_semanas(acumulador, df):
         resumo = acumulador["semanas"].setdefault(semana, {})
 
         for coluna in COMPONENTES.values():   # .values() percorre só os valores.
-            # min_count=1 faz a soma virar NaN quando todas as amostras são
-            # vazias (em vez de virar 0, que seria um valor falso).
-            resumo[coluna + "_soma"] = resumo.get(coluna + "_soma", 0.0) + grupo[coluna].sum(min_count=1)
-            resumo[coluna + "_n"] = resumo.get(coluna + "_n", 0) + grupo[coluna].count()
-
-            # Máximo da semana e o instante em que ele aconteceu.
             serie = grupo[coluna].dropna()
             if serie.empty:
                 continue
+
+            resumo[coluna + "_soma"] = resumo.get(coluna + "_soma", 0.0) + float(serie.sum())
+            resumo[coluna + "_n"] = resumo.get(coluna + "_n", 0) + len(serie)
+
+            # Máximo da semana e o instante em que ele aconteceu.
             posicao = serie.idxmax()                  # índice da maior amostra.
             maximo = float(serie.loc[posicao])
             momento = grupo.loc[posicao, "TIMESTAMP"]
@@ -1939,25 +1938,13 @@ def contar_eventos(instantes, passo):
     }
 
 
-def minimo_amostras(inicio_semana, fim_semana, inicio_janela, fim_janela):
-    """Quantas amostras uma semana precisa ter para a média ser considerada válida.
-
-    Considera apenas a parte da semana que está dentro da janela analisada
-    (a semana atual e a primeira semana são parciais).
-    """
-    # max/min escolhem os extremos; a diferença dá a duração real do trecho.
-    comeco = max(inicio_semana, inicio_janela)
-    fim = min(fim_semana, fim_janela)
-
-    segundos = (fim - comeco).total_seconds()
-    if segundos <= 0:
-        return 1
-
-    # ceil arredonda para cima: 80% de 6048 amostras -> 4839.
-    return max(1, math.ceil(segundos / PASSO * COBERTURA))
+def media_semanal(soma, quantidade):
+    if quantidade <= 0 or pd.isna(soma):
+        return None
+    return round(float(soma) / quantidade, 1)
 
 
-def montar_semanas(acumulador, semanas_datas, inicio, fim):
+def montar_semanas(acumulador, semanas_datas):
     """Monta a série semanal e os percentis de cada componente."""
     resultado = {}
 
@@ -1973,16 +1960,7 @@ def montar_semanas(acumulador, semanas_datas, inicio, fim):
             soma = resumo.get(coluna + "_soma")
             quantidade = resumo.get(coluna + "_n", 0)
 
-            # Média válida = existe soma, existem amostras e a cobertura mínima
-            # daquela semana foi atingida.
-            necessario = minimo_amostras(
-                semana, semana + pd.Timedelta(days=7), inicio, fim
-            )
-            # pd.isna cobre tanto None quanto NaN (soma sem nenhuma amostra).
-            if soma is None or pd.isna(soma) or quantidade < necessario:
-                media = None
-            else:
-                media = round(float(soma) / float(quantidade), 1)
+            media = media_semanal(soma, quantidade)
 
             medias.append(media)
             amostras.append(int(quantidade))
@@ -2254,7 +2232,7 @@ def montar_kpis(acumulador, componentes, semanas_datas, semanas_anteriores):
     }
 
 
-def montar_comparacao(acumulador, semanas_datas, semanas_anteriores, inicio):
+def montar_comparacao(acumulador, semanas_datas, semanas_anteriores):
     """Compara o período atual com o anterior.
 
     Publica três coisas usadas pela página:
@@ -2275,9 +2253,6 @@ def montar_comparacao(acumulador, semanas_datas, semanas_anteriores, inicio):
     variacao = {}
     series = {}
 
-    # O período anterior termina onde o gráfico atual começa.
-    fim_anterior = semanas_datas[0]
-
     for chave, coluna in COMPONENTES.items():
         atual[chave] = _media_das_semanas(acumulador, semanas_datas, coluna)
         anterior[chave] = _media_das_semanas(acumulador, semanas_anteriores, coluna)
@@ -2289,19 +2264,13 @@ def montar_comparacao(acumulador, semanas_datas, semanas_anteriores, inicio):
                 (atual[chave] - anterior[chave]) / anterior[chave] * 100, 1
             )
 
-        # Série semanal do período anterior, com a mesma regra de cobertura.
+        # Série semanal do período anterior com as leituras disponíveis.
         valores = []
         for semana in semanas_anteriores:
             resumo = acumulador["semanas"].get(semana, {})
             soma = resumo.get(coluna + "_soma")
             quantidade = resumo.get(coluna + "_n", 0)
-            necessario = minimo_amostras(
-                semana, semana + pd.Timedelta(days=7), inicio, fim_anterior
-            )
-            if soma is None or pd.isna(soma) or quantidade < necessario:
-                valores.append(None)
-            else:
-                valores.append(round(float(soma) / float(quantidade), 1))
+            valores.append(media_semanal(soma, quantidade))
         series[chave] = valores
 
     if all(valor is None for valor in anterior.values()):
@@ -2340,7 +2309,7 @@ def _media_das_semanas(acumulador, semanas, coluna):
     return round(soma / quantidade, 1)
 
 
-def montar_node(acumulador, agora, inicio):
+def montar_node(acumulador, agora):
     """Monta o bloco de um node no JSON final."""
     # Semana atual: segunda-feira desta semana, no fuso de São Paulo.
     semana_atual = agora.normalize() - pd.Timedelta(days=agora.dayofweek)
@@ -2359,7 +2328,7 @@ def montar_node(acumulador, agora, inicio):
     ]
 
     fim = acumulador["ultima_leitura"] or agora
-    componentes = montar_semanas(acumulador, semanas_datas, inicio, fim)
+    componentes = montar_semanas(acumulador, semanas_datas)
 
     return {
         "hostname": None,  # preenchido por quem chama esta função.
@@ -2373,7 +2342,7 @@ def montar_node(acumulador, agora, inicio):
         "kpis": montar_kpis(acumulador, componentes, semanas_datas, semanas_anteriores),
         "correlacao": montar_correlacao(acumulador),
         "comparacao": montar_comparacao(
-            acumulador, semanas_datas, semanas_anteriores, inicio
+            acumulador, semanas_datas, semanas_anteriores
         ),
     }
 
@@ -2405,8 +2374,6 @@ def executar_analista():
     # Validações de configuração antes de qualquer trabalho pesado.
     if not 0 < PASSO <= 300 or 3600 % PASSO:
         raise ValueError("COLETA_SEGUNDOS deve estar entre 1 e 300 e dividir 3600.")
-    if not 0 < COBERTURA <= 1:
-        raise ValueError("COBERTURA_MINIMA deve estar entre 0 e 1.")
     if SEMANAS <= 0:
         raise ValueError("ANALISTA_SEMANAS deve ser maior que zero.")
 
@@ -2443,7 +2410,7 @@ def executar_analista():
     # Monta um bloco por node; sorted garante ordem estável no JSON.
     nodes = []
     for hostname in sorted(acumuladores):
-        bloco = montar_node(acumuladores[hostname], agora, inicio)
+        bloco = montar_node(acumuladores[hostname], agora)
         bloco["hostname"] = hostname
         nodes.append(bloco)
 
@@ -2464,7 +2431,7 @@ def executar_analista():
             "janela_dias": JANELA_DIAS,
             "semanas": SEMANAS,
             "passo_coleta_segundos": PASSO,
-            "cobertura_minima": COBERTURA,
+            "cobertura_minima": 0.0,
             "origem": SILVER,
             "modo_local": MODO_LOCAL,
             "demonstrativo": False,
