@@ -1340,8 +1340,6 @@ SEMANAS = int(os.getenv("ANALISTA_SEMANAS", "24"))
 # A página compara o semestre atual com o anterior. Ler 48 semanas dobra o volume
 # de arquivos, então esse trecho é opcional: "1" liga, "0" desliga (padrão).
 CARREGAR_ANTERIOR = os.getenv("ANALISTA_CARREGAR_ANTERIOR", "0") == "1"
-SEMANAS_TOTAL = SEMANAS * 2 if CARREGAR_ANTERIOR else SEMANAS
-JANELA_DIAS = SEMANAS_TOTAL * 7  # dias de histórico que serão lidos.
 
 # Regras de negócio usadas pelo JSON e pela página, para que os dois falem a
 # mesma língua (o front usa os mesmos limites para desenhar os pontos).
@@ -1753,31 +1751,46 @@ def preparar_chunk(df, hosts, inicio, fim):
     return df
 
 
-def processar_chunk(df, hosts, inicio, fim, acumuladores):
-    """Limpa o chunk, alimenta os acumuladores e devolve quantas linhas sobraram."""
+def acumular_telemetria(acumulador, grupo):
+    if grupo.empty:
+        return
+
+    acumular_histograma(acumulador, grupo)
+    acumular_correlacao(acumulador, grupo)
+    acumulador["amostras"] += int(len(grupo))
+
+    maior = grupo["TIMESTAMP"].max()
+    if acumulador["ultima_leitura"] is None or maior > acumulador["ultima_leitura"]:
+        acumulador["ultima_leitura"] = maior
+
+
+def processar_chunk(df, hosts, inicio, fim, acumuladores, *, inicio_atual=None, recortes=None):
+    """Valida as leituras uma vez e agrega os recortes com as datas originais."""
     df = preparar_chunk(df, hosts, inicio, fim)
     if df.empty:
         return 0
 
-    # Pode haver mais de um node no mesmo chunk, por isso agrupamos por HOSTNAME.
+    recortes = recortes or {}
     for host, grupo in df.groupby("HOSTNAME"):
         acumulador = garantir_host(acumuladores, host)
         acumular_semanas(acumulador, grupo)
-        acumular_histograma(acumulador, grupo)
         acumular_picos(acumulador, grupo)
-        acumular_correlacao(acumulador, grupo)
 
-        acumulador["amostras"] += int(len(grupo))   # len = número de linhas.
+        atuais = grupo if inicio_atual is None else grupo[grupo["TIMESTAMP"] >= inicio_atual]
+        acumular_telemetria(acumulador, atuais)
 
-        # máximo do grupo, para sabermos até quando há telemetria.
-        maior = grupo["TIMESTAMP"].max()
-        if acumulador["ultima_leitura"] is None or maior > acumulador["ultima_leitura"]:
-            acumulador["ultima_leitura"] = maior
+        for inicio_recorte, por_host in recortes.values():
+            leituras = grupo[grupo["TIMESTAMP"] >= inicio_recorte]
+            if leituras.empty:
+                continue
+            recorte = garantir_host(por_host, host)
+            acumular_semanas(recorte, leituras)
+            acumular_telemetria(recorte, leituras)
 
     return int(len(df))
 
 
-def ler_silver_s3(s3, bucket, hosts, inicio, fim, acumuladores):
+def ler_silver_s3(s3, bucket, hosts, inicio, fim, acumuladores, *, inicio_atual=None, recortes=None):
     """Percorre os CSVs da Silver no S3 e alimenta os acumuladores."""
     lidos = 0
     ignorados = 0
@@ -1806,7 +1819,10 @@ def ler_silver_s3(s3, bucket, hosts, inicio, fim, acumuladores):
                 with io.TextIOWrapper(corpo, encoding="utf-8-sig") as texto:
                     # chunksize limita quantas linhas ficam na memória por vez.
                     for df in pd.read_csv(texto, sep=";", chunksize=50000):
-                        lidos += processar_chunk(df, hosts, inicio, fim, acumuladores)
+                        lidos += processar_chunk(
+                            df, hosts, inicio, fim, acumuladores,
+                            inicio_atual=inicio_atual, recortes=recortes
+                        )
             finally:
                 # close() libera a conexão HTTP, mesmo se o CSV estiver corrompido.
                 corpo.close()
@@ -1815,7 +1831,7 @@ def ler_silver_s3(s3, bucket, hosts, inicio, fim, acumuladores):
     return lidos, ignorados
 
 
-def ler_silver_local(hosts, inicio, fim, acumuladores):
+def ler_silver_local(hosts, inicio, fim, acumuladores, *, inicio_atual=None, recortes=None):
     """Mesma ideia da leitura S3, mas lendo uma pasta do computador."""
     pasta = Path(SILVER_LOCAL_DIR)
     if not pasta.is_dir():
@@ -1833,7 +1849,10 @@ def ler_silver_local(hosts, inicio, fim, acumuladores):
             continue
 
         for df in pd.read_csv(caminho, sep=";", chunksize=50000, encoding="utf-8-sig"):
-            lidos += processar_chunk(df, hosts, inicio, fim, acumuladores)
+            lidos += processar_chunk(
+                df, hosts, inicio, fim, acumuladores,
+                inicio_atual=inicio_atual, recortes=recortes
+            )
 
     print(f"Silver (local): {lidos} linhas válidas | {ignorados} arquivos fora da janela")
     return lidos, ignorados
@@ -1866,17 +1885,17 @@ def percentil(contagens, valor_percentil):
     return round(float(BINS[indice] + 0.05), 1)
 
 
-def regressao_linear(valores):
+def regressao_linear(indices, valores):
     """Ajusta uma reta aos valores e devolve inclinação, intercepto e resíduos.
 
-    valores: lista de números na ordem dos índices 0, 1, 2, ...
+    Os índices são as posições das semanas no calendário da série.
     Reta: y = intercepto + inclinacao * x
     """
     quantidade = len(valores)
     if quantidade < 2:
         return None  # sem dois pontos não existe reta.
 
-    xs = np.arange(quantidade, dtype=float)      # [0, 1, 2, ...]
+    xs = np.asarray(indices, dtype=float)
     ys = np.array(valores, dtype=float)
 
     # np.polyfit(grau=1) devolve [inclinacao, intercepto].
@@ -1970,7 +1989,7 @@ def montar_semanas(acumulador, semanas_datas):
         # Regressão e anomalias das médias semanais.
         indices = [posicao for posicao, _ in validos]
         valores = [valor for _, valor in validos]
-        ajuste = regressao_linear(valores)
+        ajuste = regressao_linear(indices, valores)
 
         anomalias = []
         inclinacao = None
@@ -2004,7 +2023,7 @@ def montar_semanas(acumulador, semanas_datas):
             "nome": NOMES[chave],
             "medias": medias,
             "amostras": amostras,
-            "media_geral": round(float(np.mean(valores)), 1) if valores else None,
+            "media_geral": _media_das_semanas(acumulador, semanas_datas, coluna),
             "percentis": {
                 "p50": percentil(acumulador["histograma"][chave], 50),
                 "p90": percentil(acumulador["histograma"][chave], 90),
@@ -2016,8 +2035,8 @@ def montar_semanas(acumulador, semanas_datas):
                 "intercepto": intercepto,
                 "linha": [
                     # min/max limitam a reta ao intervalo 0..100%.
-                    round(min(100.0, max(0.0, intercepto + inclinacao * posicao)), 1)
-                    if ajuste is not None else None
+                    round(min(100.0, max(0.0, ajuste["intercepto"] + ajuste["inclinacao"] * posicao)), 1)
+                    if ajuste is not None and indices[0] <= posicao <= indices[-1] else None
                     for posicao in range(len(semanas_datas))
                 ],
             },
@@ -2095,14 +2114,14 @@ def maior_das_semanas(acumulador, semanas, coluna):
     return melhor
 
 
-def montar_kpis(acumulador, componentes, semanas_datas, semanas_anteriores):
+def montar_kpis(acumulador, componentes, semanas_datas, semanas_anteriores, *, inicio, picos=None):
     """Resume os eventos do node nos cartões de KPI da página.
 
     Calcula o período atual e também o anterior, porque a página mostra a
     diferença entre os dois (+2 picos, +30 min, +9%).
     """
-    # Primeira semana do gráfico: tudo antes dela pertence ao período anterior.
-    limite_anterior = semanas_datas[0]
+    # Os recortes usam os mesmos instantes de pico acumulados na leitura.
+    picos = acumulador["picos"] if picos is None else picos
 
     # Picos do período atual: calculamos por componente e somamos.
     total_eventos = 0
@@ -2112,7 +2131,7 @@ def montar_kpis(acumulador, componentes, semanas_datas, semanas_anteriores):
 
     for chave in COMPONENTES:
         # Só os instantes dentro do período exibido no gráfico.
-        atuais = [t for t in acumulador["picos"][chave] if t >= limite_anterior]
+        atuais = [t for t in picos[chave] if t >= inicio]
         resumo = contar_eventos(atuais, PASSO)
 
         resumo_picos[chave] = {
@@ -2133,14 +2152,16 @@ def montar_kpis(acumulador, componentes, semanas_datas, semanas_anteriores):
     anterior_duracao_total = 0.0
     anterior_duracao_mais_longa = 0.0
 
-    for chave in COMPONENTES:
-        antigos = [t for t in acumulador["picos"][chave] if t < limite_anterior]
-        resumo = contar_eventos(antigos, PASSO)
-        anterior_eventos += resumo["eventos"]
-        anterior_duracao_total += resumo["duracao_acumulada_segundos"]
-        anterior_duracao_mais_longa = max(
-            anterior_duracao_mais_longa, resumo["duracao_evento_mais_longo_segundos"]
-        )
+    if semanas_anteriores:
+        inicio_anterior = semanas_anteriores[0]
+        for chave in COMPONENTES:
+            antigos = [t for t in picos[chave] if inicio_anterior <= t < inicio]
+            resumo = contar_eventos(antigos, PASSO)
+            anterior_eventos += resumo["eventos"]
+            anterior_duracao_total += resumo["duracao_acumulada_segundos"]
+            anterior_duracao_mais_longa = max(
+                anterior_duracao_mais_longa, resumo["duracao_evento_mais_longo_segundos"]
+            )
 
     # Maior pico do período atual: a maior leitura isolada entre os componentes.
     # Só entra no KPI se realmente passou do limite de pico.
@@ -2164,7 +2185,7 @@ def montar_kpis(acumulador, componentes, semanas_datas, semanas_anteriores):
     maior_pico_anterior = None
     for chave, coluna in COMPONENTES.items():
         registro = maior_das_semanas(acumulador, semanas_anteriores, coluna)
-        if registro is None:
+        if registro is None or registro["valor"] <= LIMITE_PICO:
             continue
         if maior_pico_anterior is None or registro["valor"] > maior_pico_anterior["valor"]:
             maior_pico_anterior = {
@@ -2309,41 +2330,29 @@ def _media_das_semanas(acumulador, semanas, coluna):
     return round(soma / quantidade, 1)
 
 
-def montar_node(acumulador, agora):
-    """Monta o bloco de um node no JSON final."""
-    # Semana atual: segunda-feira desta semana, no fuso de São Paulo.
-    semana_atual = agora.normalize() - pd.Timedelta(days=agora.dayofweek)
+def inicio_da_semana(data):
+    return data.normalize() - pd.Timedelta(days=data.dayofweek)
 
-    # Lista das últimas SEMANAS semanas, da mais antiga para a mais recente.
-    # list comprehension: para cada i, recua (SEMANAS - 1 - i) semanas.
-    semanas_datas = [
-        semana_atual - pd.Timedelta(weeks=SEMANAS - 1 - i) for i in range(SEMANAS)
-    ]
 
-    # As semanas anteriores são as que terminam onde o gráfico começa.
-    # range(SEMANAS) gera 0..SEMANAS-1; o offset SEMANAS-i vai de SEMANAS até 1,
-    # produzindo a lista em ordem crescente (mais antiga primeiro).
-    semanas_anteriores = [
-        semanas_datas[0] - pd.Timedelta(weeks=SEMANAS - i) for i in range(SEMANAS)
-    ]
-
-    fim = acumulador["ultima_leitura"] or agora
+def montar_node(acumulador, agora, inicio, *, semanas_anteriores=(), picos=None):
+    """Monta a série e as estatísticas do mesmo intervalo de coleta."""
+    semanas_datas = pd.date_range(inicio_da_semana(inicio), inicio_da_semana(agora), freq="7D").tolist()
     componentes = montar_semanas(acumulador, semanas_datas)
 
     return {
-        "hostname": None,  # preenchido por quem chama esta função.
-        "telemetria_ate": fim,
+        "inicio": inicio,
+        "fim": agora,
+        "telemetria_ate": acumulador["ultima_leitura"],
         "amostras": acumulador["amostras"],
         "semanas": {
             "datas": [dia.date().isoformat() for dia in semanas_datas],
             "rotulos": [rotulo_semana(dia) for dia in semanas_datas],
         },
         "componentes": componentes,
-        "kpis": montar_kpis(acumulador, componentes, semanas_datas, semanas_anteriores),
-        "correlacao": montar_correlacao(acumulador),
-        "comparacao": montar_comparacao(
-            acumulador, semanas_datas, semanas_anteriores
+        "kpis": montar_kpis(
+            acumulador, componentes, semanas_datas, semanas_anteriores, inicio=inicio, picos=picos
         ),
+        "correlacao": montar_correlacao(acumulador),
     }
 
 
@@ -2389,19 +2398,32 @@ def executar_analista():
         raise ValueError("Cluster sem nodes cadastrados.")
 
     agora = pd.Timestamp.now(tz=FUSO)
-    inicio = agora - pd.Timedelta(days=JANELA_DIAS)
+    inicio_atual = inicio_da_semana(agora) - pd.Timedelta(weeks=SEMANAS - 1)
+    semanas_anteriores = []
+    if CARREGAR_ANTERIOR:
+        fim_anterior = inicio_atual - pd.Timedelta(weeks=1)
+        semanas_anteriores = pd.date_range(end=fim_anterior, periods=SEMANAS, freq="7D").tolist()
 
-    acumuladores = {}   # dicionário vazio: será preenchido durante a leitura.
+    recortes = {
+        "1": (agora - pd.Timedelta(days=30), {}),
+        "3": (agora - pd.DateOffset(months=3), {}),
+    }
+    inicio_historico = semanas_anteriores[0] if semanas_anteriores else inicio_atual
+    inicio = min(inicio_historico, *(corte for corte, _ in recortes.values()))
+    acumuladores = {}
 
     if MODO_LOCAL:
-        lidos, ignorados = ler_silver_local(hosts, inicio, agora, acumuladores)
+        lidos, ignorados = ler_silver_local(
+            hosts, inicio, agora, acumuladores, inicio_atual=inicio_atual, recortes=recortes
+        )
     else:
         bucket = os.environ["BUCKET_NAME"]
         regiao = os.getenv("AWS_REGION", os.getenv("REGION_NAME", "us-east-1"))
         s3 = boto3.client("s3", region_name=regiao)
         bucket_silver = os.getenv("SILVER_BUCKET_NAME", bucket)
         lidos, ignorados = ler_silver_s3(
-            s3, bucket_silver, hosts, inicio, agora, acumuladores
+            s3, bucket_silver, hosts, inicio, agora, acumuladores,
+            inicio_atual=inicio_atual, recortes=recortes
         )
 
     if not acumuladores:
@@ -2409,9 +2431,17 @@ def executar_analista():
 
     # Monta um bloco por node; sorted garante ordem estável no JSON.
     nodes = []
-    for hostname in sorted(acumuladores):
-        bloco = montar_node(acumuladores[hostname], agora)
+    for hostname, acumulador in sorted(acumuladores.items()):
+        bloco = montar_node(acumulador, agora, inicio_atual, semanas_anteriores=semanas_anteriores)
         bloco["hostname"] = hostname
+        semanas_datas = pd.date_range(inicio_atual, periods=SEMANAS, freq="7D").tolist()
+        bloco["comparacao"] = montar_comparacao(acumulador, semanas_datas, semanas_anteriores)
+        bloco["periodos"] = {}
+        for periodo, (corte, por_host) in recortes.items():
+            resumo = por_host.get(hostname)
+            if resumo is None:
+                resumo = novo_acumulador()
+            bloco["periodos"][periodo] = montar_node(resumo, agora, corte, picos=acumulador["picos"])
         nodes.append(bloco)
 
     avisos = [
@@ -2427,11 +2457,13 @@ def executar_analista():
         "metadados": {
             "cluster_id": cluster_id,
             "gerado_em": agora,
-            "telemetria_ate": max(acumulador["ultima_leitura"] for acumulador in acumuladores.values()),
-            "janela_dias": JANELA_DIAS,
+            "telemetria_ate": max((node["telemetria_ate"] for node in nodes if node["telemetria_ate"] is not None), default=None),
+            "janela_dias": math.ceil((agora - inicio) / pd.Timedelta(days=1)),
             "semanas": SEMANAS,
             "passo_coleta_segundos": PASSO,
             "cobertura_minima": 0.0,
+            "limite_pico": LIMITE_PICO,
+            "limite_residuo": LIMITE_RESIDUO,
             "origem": SILVER,
             "modo_local": MODO_LOCAL,
             "demonstrativo": False,
