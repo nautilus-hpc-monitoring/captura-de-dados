@@ -307,7 +307,7 @@ if __name__ == '__main__':
     print(start_msg)
 
     email = input('Email: ')
-    password = input('Senha: ')
+    password = getpass('Senha: ')
     credenciais_login = {'email': email, 'senha': password, 'hostname': host}
 
     try:
