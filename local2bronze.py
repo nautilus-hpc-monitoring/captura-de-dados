@@ -6,15 +6,18 @@ import csv
 from datetime import datetime
 import socket
 import logging
+import shutil
+from pathlib import Path
 from getpass import getpass
 from datetime import timezone
 from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError
 from boto3.exceptions import S3UploadFailedError
 
 host = socket.gethostname()
-url_auth = os.getenv('AUTH_URL', 'http://localhost:3000/auth/').rstrip('/')
+url_auth = os.getenv('AUTH_URL', 'http://localhost:3333/auth/').rstrip('/')
 url_credenciais = url_auth + '/credenciais'
 credenciais_login = None
+empresa_id_autenticada = None
 
 def renovar_credenciais():
     global s3_client
@@ -148,6 +151,7 @@ cabecalho = [
     'TIMESTAMP',
     'HOSTNAME',
     'USER',
+    'EMPRESA_ID',
 
     'CPU_PERCENT',
     'CPU_USER_PERCENT',
@@ -198,6 +202,16 @@ def upload_file(file_name, bucket, object_name):
 
 INTERVALO = 10  
 LOTE = 6 
+BILLING_LOCAL_DIR = Path(__file__).resolve().parent / 'silver_local'
+SALVAR_BILLING_LOCAL = os.getenv('SALVAR_BILLING_LOCAL', 'true').lower() == 'true'
+
+
+def salvar_copia_billing_local(caminho_origem, nome_arquivo):
+    if not SALVAR_BILLING_LOCAL:
+        return
+    BILLING_LOCAL_DIR.mkdir(parents=True, exist_ok=True)
+    destino = BILLING_LOCAL_DIR / nome_arquivo
+    shutil.copy2(caminho_origem, str(destino))
 
 def enviar_lote(linhas):
     momento = datetime.now()
@@ -217,6 +231,7 @@ def enviar_lote(linhas):
         writer.writerows(linhas)
 
     try:
+        salvar_copia_billing_local(caminho_local, nome_caminho)
         return upload_file(caminho_local, os.getenv('BUCKET_NAME'), objeto)
     finally:
         os.remove(caminho_local)
@@ -237,6 +252,7 @@ def escrita():
                 timestamp,
                 host,
                 usuario,
+                empresa_id_autenticada,
 
                 *cpu,
                 *ram,
@@ -288,6 +304,7 @@ if __name__ == '__main__':
 
 
         if res.get('autenticado'):
+            empresa_id_autenticada = res.get('empresa_id')
             print('\nAutenticação realizada com sucesso!')
             escrita()
 
