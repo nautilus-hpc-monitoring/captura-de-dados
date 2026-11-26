@@ -1,11 +1,3 @@
-"""Simulacao parametrizada da telemetria HPC nos estados normal e de incidente.
-
-Reproduz as convencoes de gerar_amostra.py: a normalidade e gerada pelas
-mesmas formulas (offsets por host, ciclo diario, ruido AR(1) e EMA dos loads)
-e os incidentes somam os deltos trapezoidais sobre essa base. Nenhum rotulo e
-enviado ao S3.
-"""
-
 from __future__ import annotations
 
 import csv
@@ -107,10 +99,10 @@ class InjetorIncidentes:
         self.eventos_por_dia = max(1, inteiro("INJETAR_EVENTOS_POR_DIA", 8))
         self.principais = max(1, inteiro("INJETAR_PRINCIPAIS", 5))
         self.secundarios = max(1, inteiro("INJETAR_SECUNDARIOS", 3))
-        self.subida = inter("INJETAR_SUBIDA_MIN", (60.0, 120.0))
-        self.plato = inter("INJETAR_PLATO_MIN", (30.0, 90.0))
-        self.descida = inter("INJETAR_DESCIDA_MIN", (20.0, 40.0))
-        self.jitter = inter("INJETAR_JITTER_MIN", (1.0, 8.0))
+        self.subida = inter("INJETAR_SUBIDA", (60.0, 120.0))
+        self.plato = inter("INJETAR_PLATO", (30.0, 90.0))
+        self.descida = inter("INJETAR_DESCIDA", (20.0, 40.0))
+        self.jitter = inter("INJETAR_JITTER", (1.0, 8.0))
         self.primeiro_incidente_min = max(0.0, decimal("INJETAR_PRIMEIRO_INCIDENTE_MIN", 5.0))
         permitidos = tuple(
             int(item) for item in os.getenv("INJETAR_CENARIOS", "1,2,3,4").split(",")
