@@ -22,6 +22,7 @@ import json
 import math
 import os
 import tempfile
+import zlib
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -36,7 +37,7 @@ from dotenv import load_dotenv
 load_dotenv()
 FUSO = "America/Sao_Paulo"
 ORIGEM = os.getenv("GESTOR_FUSO_ORIGEM", FUSO)
-SILVER = os.getenv("SILVER_PREFIX", "02-silver/")
+SILVER = "02-silver/"
 GOLD = os.getenv("CLUSTER_GOLD_PREFIX", "03-gold/gestor").rstrip("/")
 PASSO = int(os.getenv("COLETA_SEGUNDOS", "10"))
 COBERTURA = float(os.getenv("COBERTURA_MINIMA", "0.8"))
@@ -48,6 +49,17 @@ OPERADOR_CLUSTER_ID = int(os.getenv("OPERADOR_CLUSTER_ID", "0"))
 OPERADOR_LIMITE_ATENCAO = float(os.getenv("OPERADOR_LIMITE_ATENCAO", "75"))
 OPERADOR_LIMITE_CRITICO = float(os.getenv("OPERADOR_LIMITE_CRITICO", "90"))
 OPERADOR_COLUNAS = list(COLUNAS) + ["DISCO_PERCENT"]
+
+# ETL Billing (Silver -> Gold Billing)
+# Sempre roda em modo híbrido: gera histórico sintético e sobrepõe as horas reais.
+BILLING_MODO = "hibrido"
+BILLING_DIAS_REAL = int(os.getenv("BILLING_DIAS_REAL", "90"))
+BILLING_TARIFA_BASE = float(os.getenv("BILLING_TARIFA_BASE", "0.44"))
+BILLING_TARIFA_AMPLITUDE = float(os.getenv("BILLING_TARIFA_AMPLITUDE", "0.18"))
+BILLING_ADICIONAL_PICO = float(os.getenv("BILLING_ADICIONAL_PICO", "0.16"))
+BILLING_GERAR_ALERTAS = os.getenv("BILLING_GERAR_ALERTAS", "true") == "true"
+BILLING_ORIGEM_ALERTA = "[billing-etl]"
+BILLING_GOLD_PREFIX = os.getenv("BILLING_GOLD_PREFIX", "03-gold/billing").rstrip("/")
 
 
 # 1. CADASTRO: nodes informados na configuração ou consultados no banco.
@@ -180,6 +192,94 @@ def carregar_silver(s3, bucket, hosts, agora, inicio=None, colunas=None):
                 corpo.close()
     if not partes:
         raise ValueError("Nenhum dado Silver encontrado para os hosts do cluster.")
+    df = pd.concat(partes, ignore_index=True)
+    return (df.drop_duplicates(["HOSTNAME", "TIMESTAMP"])
+            .sort_values(["HOSTNAME", "TIMESTAMP"]))
+
+
+def carregar_silver_billing(s3, bucket, agora, inicio=None, colunas=None):
+    partes = []
+    if inicio is None:
+        inicio = agora - pd.Timedelta(days=45)
+    if colunas is None:
+        colunas = COLUNAS
+
+    paginas = s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=SILVER)
+    for pagina in paginas:
+        for item in pagina.get("Contents", []):
+            if not item["Key"].endswith(".csv"):
+                continue
+            corpo = s3.get_object(Bucket=bucket, Key=item["Key"])["Body"]
+            try:
+                with io.TextIOWrapper(corpo, encoding="utf-8-sig") as texto:
+                    for df in pd.read_csv(texto, sep=";", chunksize=50000):
+                        if not {"HOSTNAME", "TIMESTAMP"}.issubset(df.columns):
+                            continue
+                        df = df.copy()
+                        df["TIMESTAMP"] = pd.to_datetime(df["TIMESTAMP"].map(instante), utc=True).dt.tz_convert(FUSO)
+                        df = df[df["TIMESTAMP"].between(inicio, agora)].copy()
+                        if df.empty:
+                            continue
+                        for c in colunas:
+                            df[c] = pd.to_numeric(df[c], errors="coerce") if c in df else np.nan
+                            df[c] = df[c].where(np.isfinite(df[c]) & (df[c] >= 0))
+                            if c.endswith("_PERCENT"):
+                                df[c] = df[c].where(df[c] <= 100)
+                        colunas_saida = ["HOSTNAME", "TIMESTAMP"] + colunas
+                        if "EMPRESA_ID" in df.columns:
+                            colunas_saida.append("EMPRESA_ID")
+                        partes.append(df[colunas_saida])
+            finally:
+                corpo.close()
+
+    if not partes:
+        raise ValueError("Nenhum dado Silver encontrado para billing.")
+
+    df = pd.concat(partes, ignore_index=True)
+    return (df.drop_duplicates(["HOSTNAME", "TIMESTAMP"])
+            .sort_values(["HOSTNAME", "TIMESTAMP"]))
+
+
+def carregar_silver_billing_local(agora, inicio=None, colunas=None):
+    if inicio is None:
+        inicio = agora - pd.Timedelta(days=45)
+    if colunas is None:
+        colunas = COLUNAS
+
+    pasta = Path(SILVER_LOCAL_DIR)
+    if not pasta.exists():
+        raise ValueError(f"Pasta local não encontrada: {SILVER_LOCAL_DIR}")
+
+    partes = []
+    for caminho in sorted(pasta.rglob("*.csv")):
+        try:
+            df = pd.read_csv(caminho, sep=';', low_memory=False)
+        except Exception:
+            continue
+
+        if not {"HOSTNAME", "TIMESTAMP"}.issubset(df.columns):
+            continue
+
+        df = df.copy()
+        df["TIMESTAMP"] = pd.to_datetime(df["TIMESTAMP"].map(instante), utc=True).dt.tz_convert(FUSO)
+        df = df[df["TIMESTAMP"].between(inicio, agora)].copy()
+        if df.empty:
+            continue
+
+        for c in colunas:
+            df[c] = pd.to_numeric(df[c], errors="coerce") if c in df else np.nan
+            df[c] = df[c].where(np.isfinite(df[c]) & (df[c] >= 0))
+            if c.endswith("_PERCENT"):
+                df[c] = df[c].where(df[c] <= 100)
+
+        colunas_saida = ["HOSTNAME", "TIMESTAMP"] + colunas
+        if "EMPRESA_ID" in df.columns:
+            colunas_saida.append("EMPRESA_ID")
+        partes.append(df[colunas_saida])
+
+    if not partes:
+        raise ValueError("Nenhum dado Silver local encontrado para billing.")
+
     df = pd.concat(partes, ignore_index=True)
     return (df.drop_duplicates(["HOSTNAME", "TIMESTAMP"])
             .sort_values(["HOSTNAME", "TIMESTAMP"]))
@@ -414,7 +514,7 @@ def executar():
         raise ValueError("Cluster sem nodes cadastrados.")
     s3 = boto3.client("s3", region_name=os.getenv("AWS_REGION", os.getenv("REGION_NAME", "us-east-1")))
     agora = pd.Timestamp.now(tz=FUSO)
-    bucket_silver = os.getenv("SILVER_BUCKET_NAME", bucket)
+    bucket_silver = bucket
     df = carregar_silver(s3, bucket_silver, hosts, agora)
     if df.empty:
         raise ValueError("Silver sem leituras válidas no período; publicação cancelada.")
@@ -1406,7 +1506,7 @@ def processar_categorizacao():
 
     agora = pd.Timestamp.now(tz=FUSO)
     inicio = agora - timedelta(hours=HORAS_JANELA)
-    bucket_silver = os.getenv("SILVER_BUCKET_NAME", bucket)
+    bucket_silver = bucket
 
     df = carregar_silver(
         s3_client,
@@ -2562,7 +2662,7 @@ def executar_analista():
         bucket = os.environ["BUCKET_NAME"]
         regiao = os.getenv("AWS_REGION", os.getenv("REGION_NAME", "us-east-1"))
         s3 = boto3.client("s3", region_name=regiao)
-        bucket_silver = os.getenv("SILVER_BUCKET_NAME", bucket)
+        bucket_silver = bucket
         lidos, ignorados = ler_silver_s3(
             s3, bucket_silver, hosts, inicio, agora, acumuladores,
             inicio_atual=inicio_atual, recortes=recortes
@@ -2660,7 +2760,7 @@ def executar_operador():
     bucket = os.environ["BUCKET_NAME"]
     s3 = boto3.client("s3", region_name=os.getenv("AWS_REGION", os.getenv("REGION_NAME", "us-east-1")))
     agora = pd.Timestamp.now(tz=FUSO)
-    bucket_silver = os.getenv("SILVER_BUCKET_NAME", bucket)
+    bucket_silver = bucket
     hosts = sorted(catalogo)
     df = carregar_silver(s3, bucket_silver, hosts, agora,
                          inicio=agora - pd.Timedelta(days=45), colunas=OPERADOR_COLUNAS)
@@ -2731,6 +2831,438 @@ def lambda_handler_operador(event, context):
             if not os.getenv(variavel):
                 raise ValueError(f"Configure a variável {variavel} na Lambda.")
     return executar_operador()
+
+
+# ---------------------------------------------------------------------------
+# ETL BILLING: lê Silver e grava billing_node_horario no MySQL.
+# ---------------------------------------------------------------------------
+def ano_referencia_setembro(agora):
+    inicio_ano = pd.Timestamp(year=agora.year, month=9, day=1, tz=FUSO)
+    return agora.year if agora >= inicio_ano else agora.year - 1
+
+
+def janela_billing(modo, agora):
+    if modo in ("sintetico", "hibrido"):
+        ano = ano_referencia_setembro(agora)
+        inicio = pd.Timestamp(year=ano, month=9, day=1, hour=0, minute=0, second=0, tz=FUSO)
+        fim = agora.floor("1h")
+        return inicio, fim
+    return agora - pd.Timedelta(days=BILLING_DIAS_REAL), agora
+
+
+def mesclar_registros_billing(registros_sinteticos, registros_reais):
+    # Chave por node+hora. Dados reais sempre sobrescrevem o sintético.
+    mapa = {}
+
+    for registro in registros_sinteticos:
+        instante = pd.Timestamp(registro["timestamp"]).floor("h")
+        chave = (int(registro["id_node"]), instante.isoformat())
+        mapa[chave] = registro
+
+    for registro in registros_reais:
+        instante = pd.Timestamp(registro["timestamp"]).floor("h")
+        chave = (int(registro["id_node"]), instante.isoformat())
+        mapa[chave] = registro
+
+    registros = list(mapa.values())
+    registros.sort(key=lambda item: (int(item["id_empresa"]), int(item["id_node"]), pd.Timestamp(item["timestamp"])))
+    return registros
+
+
+def catalogo_billing_de_dataframe(df):
+    empresa_padrao = int(os.getenv("BILLING_EMPRESA_PADRAO", "1"))
+    hosts = sorted(df["HOSTNAME"].dropna().astype(str).unique().tolist())
+    empresas_por_host = {}
+    if "EMPRESA_ID" in df.columns:
+        validos = df[["HOSTNAME", "EMPRESA_ID"]].dropna().copy()
+        if not validos.empty:
+            validos["HOSTNAME"] = validos["HOSTNAME"].astype(str)
+            validos["EMPRESA_ID"] = pd.to_numeric(validos["EMPRESA_ID"], errors="coerce")
+            validos = validos.dropna()
+            if not validos.empty:
+                validos["EMPRESA_ID"] = validos["EMPRESA_ID"].astype(int)
+                empresas_por_host = (
+                    validos.groupby("HOSTNAME")["EMPRESA_ID"]
+                    .agg(lambda serie: int(serie.mode().iloc[0]) if not serie.mode().empty else int(serie.iloc[0]))
+                    .to_dict()
+                )
+
+    catalogo = {}
+    for indice, hostname in enumerate(sorted(set([str(h).strip() for h in hosts if str(h).strip()])), start=1):
+        catalogo[hostname] = {
+            "id_node": indice,
+            "hostname": hostname,
+            "id_cluster": 0,
+            "id_ambiente_hpc": None,
+            "id_empresa": int(empresas_por_host.get(hostname, empresa_padrao)),
+        }
+    return catalogo
+
+
+def parametros_billing_padrao(catalogo):
+    parametros = {}
+    for info in catalogo.values():
+        id_node = int(info["id_node"])
+        parametros[id_node] = {
+            "potencia_idle_kw": round(0.2200 + (id_node % 5) * 0.0700 + ((id_node - 1) // 5) * 0.0300, 4),
+            "potencia_max_kw": round(0.6500 + (id_node % 5) * 0.1500 + ((id_node - 1) // 5) * 0.0800, 4),
+            "fator_gamma": round(1.080 + (id_node % 4) * 0.080, 3),
+            "tarifa_alpha": round(0.8800 + (id_node % 6) * 0.0700, 4),
+            "tarifa_beta": round(((id_node % 3) - 1) * 0.004500, 6),
+            "encargos_kwh": round(0.090000 + (id_node % 4) * 0.018000, 6),
+            "tarifa_fallback_kwh": round(0.780000 + (id_node % 5) * 0.040000, 6),
+        }
+    return parametros
+
+
+def tarifa_horaria(parametros, instante_hora):
+    base = BILLING_TARIFA_BASE
+    sazonal_anual = BILLING_TARIFA_AMPLITUDE * math.sin(2 * math.pi * (instante_hora.dayofyear / 365.0))
+    sazonal_mensal = 0.10 * math.sin(2 * math.pi * (instante_hora.day / 31.0))
+    pico = BILLING_ADICIONAL_PICO if 17 <= instante_hora.hour <= 21 else 0.0
+    tarifa = (
+        parametros["tarifa_alpha"] * (base + sazonal_anual + sazonal_mensal + pico)
+        + parametros["tarifa_beta"]
+        + parametros["encargos_kwh"]
+    )
+    piso = parametros["tarifa_fallback_kwh"] * 0.20
+    return max(piso, tarifa)
+
+
+def consumo_e_custo(cpu_percent, parametros, instante_hora):
+    cpu = max(0.0, min(100.0, float(cpu_percent)))
+    consumo = parametros["potencia_idle_kw"] + (
+        parametros["potencia_max_kw"] - parametros["potencia_idle_kw"]
+    ) * ((cpu / 100.0) ** parametros["fator_gamma"])
+    tarifa = tarifa_horaria(parametros, instante_hora)
+    custo = consumo * tarifa
+    return round(consumo, 4), round(tarifa, 6), round(custo, 2)
+
+
+def gerar_cpu_sintetica(hostname, id_node, instante_hora):
+    ruido_base = zlib.crc32(f"{hostname}-{instante_hora.strftime('%Y%m%d%H')}".encode("utf-8")) % 1000
+    ruido = (ruido_base / 1000.0 - 0.5)
+    valor = (
+        35
+        + (12 + (id_node % 5) * 4) * math.sin(2 * math.pi * (instante_hora.hour / 24.0))
+        + (8 + (id_node % 4) * 3) * math.sin(2 * math.pi * (instante_hora.weekday() / 7.0) + (id_node / 5.0))
+        + ruido * (10 + (id_node % 6) * 4)
+        + (16 if id_node % 5 == 0 else 10 if id_node % 5 == 4 else -6 if id_node % 5 == 1 else 0)
+    )
+    return round(max(3.0, min(100.0, valor)), 2)
+
+
+def montar_registros_billing_reais(df, catalogo, parametros):
+    registros = []
+    for hostname, grupo in df.groupby("HOSTNAME"):
+        info = catalogo.get(str(hostname))
+        if not info:
+            continue
+        id_node = info["id_node"]
+        parametro = parametros.get(id_node)
+        if not parametro:
+            continue
+        serie = (grupo.set_index("TIMESTAMP")["CPU_PERCENT"]
+                 .resample("1h")
+                 .mean()
+                 .dropna())
+        for instante_hora, cpu in serie.items():
+            consumo, tarifa, custo = consumo_e_custo(cpu, parametro, instante_hora)
+            registros.append({
+                "timestamp": instante_hora,
+                "media_cpu_pct": round(float(cpu), 2),
+                "consumo_kwh": consumo,
+                "tarifa_kwh": tarifa,
+                "custo_estimado": custo,
+                "id_node": id_node,
+                "hostname": info["hostname"],
+                "id_empresa": info["id_empresa"],
+            })
+    return registros
+
+
+def montar_registros_billing_sinteticos(catalogo, parametros, inicio, fim):
+    registros = []
+    horas = pd.date_range(inicio, fim, freq="1h")
+    for host, info in sorted(catalogo.items()):
+        id_node = info["id_node"]
+        parametro = parametros.get(id_node)
+        if not parametro:
+            continue
+        for instante_hora in horas:
+            cpu = gerar_cpu_sintetica(host, id_node, instante_hora)
+            consumo, tarifa, custo = consumo_e_custo(cpu, parametro, instante_hora)
+            registros.append({
+                "timestamp": instante_hora,
+                "media_cpu_pct": cpu,
+                "consumo_kwh": consumo,
+                "tarifa_kwh": tarifa,
+                "custo_estimado": custo,
+                "id_node": id_node,
+                "hostname": info["hostname"],
+                "id_empresa": info["id_empresa"],
+            })
+    return registros
+
+
+def sintetizar_alertas_billing(df_horas):
+    if df_horas.empty or not BILLING_GERAR_ALERTAS:
+        base = df_horas.copy()
+        base["aviso_hora"] = 0
+        base["critico_hora"] = 0
+        return base
+
+    estat = df_horas.groupby("id_node", as_index=False).agg(
+        media_custo=("custo_estimado", "mean"),
+        desvio_custo=("custo_estimado", "std"),
+        media_consumo=("consumo_kwh", "mean"),
+        desvio_consumo=("consumo_kwh", "std"),
+        media_tarifa=("tarifa_kwh", "mean"),
+        desvio_tarifa=("tarifa_kwh", "std"),
+    )
+    for coluna in ("desvio_custo", "desvio_consumo", "desvio_tarifa"):
+        estat[coluna] = estat[coluna].fillna(0.0).clip(lower=0.02)
+
+    df = df_horas.merge(estat, on="id_node", how="left")
+    df["pressao"] = ((df["consumo_kwh"] - df["media_consumo"]) / df["desvio_consumo"]) + (
+        (df["tarifa_kwh"] - df["media_tarifa"]) / df["desvio_tarifa"]
+    )
+
+    critico_cond = (
+        (df["pressao"] >= 2.4)
+        | (df["custo_estimado"] >= (df["media_custo"] + df["desvio_custo"] * 1.20))
+        | (df["media_cpu_pct"] >= 90)
+    )
+    aviso_cond = (
+        critico_cond
+        | (df["pressao"] >= 1.3)
+        | (df["custo_estimado"] >= (df["media_custo"] + df["desvio_custo"] * 0.70))
+        | (df["media_cpu_pct"] >= 75)
+    )
+
+    chave = df.apply(lambda r: f"{int(r.id_node)}-{r.timestamp.strftime('%Y%m%d%H')}".encode("utf-8"), axis=1)
+    modulo = chave.map(lambda texto: zlib.crc32(texto) % 12)
+
+    df["critico_hora"] = ((critico_cond & (modulo <= 2))).astype(int)
+    df["aviso_hora"] = ((aviso_cond & (modulo <= 6))).astype(int)
+    df.loc[df["critico_hora"] == 1, "aviso_hora"] = 0
+    return df
+
+
+def mes_ref(data):
+    return f"{int(data.year):04d}-{int(data.month):02d}"
+
+
+def calcular_metricas_periodo(payload_mes):
+    custos = payload_mes["historicoDiario"]["custos"]
+    consumo = payload_mes["periodoMensal"]["consumoKwh"]
+    impacto = payload_mes["decomposicaoDiaria"]["impactoTarifa"]
+    return {
+        "acumuladoMes": round(float(sum(custos)), 2),
+        "projecaoFechamento": round(float(sum(custos)), 2),
+        "consumoKwh": round(float(consumo), 4),
+        "impactoTarifa": round(float(sum(impacto)), 2),
+    }
+
+
+def gravar_billing_saida(s3, bucket, chave, dados, estado_saida):
+    if estado_saida["modo"] == "local":
+        caminho = Path(GOLD_LOCAL_DIR) / chave
+        caminho.parent.mkdir(parents=True, exist_ok=True)
+        caminho.write_text(
+            json.dumps(limpar_json(dados), ensure_ascii=False, allow_nan=False),
+            encoding="utf-8"
+        )
+        return
+
+    try:
+        gravar(s3, bucket, chave, dados)
+    except ClientError as erro:
+        codigo = erro.response.get("Error", {}).get("Code")
+        if codigo not in ("AccessDenied", "AllAccessDisabled"):
+            raise
+
+        estado_saida["modo"] = "local"
+        estado_saida["motivo"] = "Sem permissão de escrita no S3; usando Gold local para billing."
+        print(f"Billing: {estado_saida['motivo']}")
+        caminho = Path(GOLD_LOCAL_DIR) / chave
+        caminho.parent.mkdir(parents=True, exist_ok=True)
+        caminho.write_text(
+            json.dumps(limpar_json(dados), ensure_ascii=False, allow_nan=False),
+            encoding="utf-8"
+        )
+
+
+def montar_payload_mes(df_mes, metricas_mes_anterior):
+    if df_mes.empty:
+        return None
+
+    diarios = (df_mes.groupby("dia", as_index=False)
+               .agg(custo_dia=("custo_estimado", "sum"),
+                    consumo_dia=("consumo_kwh", "sum"),
+                    tarifa_media_dia=("tarifa_kwh", "mean"),
+                    aviso=("aviso_hora", "sum"),
+                    critico=("critico_hora", "sum"))
+               .sort_values("dia"))
+
+    if diarios.empty:
+        return None
+
+    tarifa_base = diarios["tarifa_media_dia"].where(diarios["tarifa_media_dia"] > 0).min()
+    if pd.isna(tarifa_base):
+        tarifa_base = max(0.0001, diarios["tarifa_media_dia"].mean() * 0.75)
+
+    impacto_consumo = []
+    impacto_tarifa = []
+    for _, linha in diarios.iterrows():
+        efeito_consumo = min(float(linha.custo_dia) * 0.92, float(linha.consumo_dia) * float(tarifa_base))
+        efeito_tarifa = max(0.0, float(linha.custo_dia) - efeito_consumo)
+        impacto_consumo.append(round(efeito_consumo, 2))
+        impacto_tarifa.append(round(efeito_tarifa, 2))
+
+    ranking = (df_mes.groupby("hostname", as_index=False)
+               .agg(custo_total=("custo_estimado", "sum"),
+                    consumo_total=("consumo_kwh", "sum"),
+                    aviso=("aviso_hora", "sum"),
+                    critico=("critico_hora", "sum"))
+               .sort_values("custo_total", ascending=False))
+
+    primeiro = diarios.iloc[0]["dia"]
+    ultimo = diarios.iloc[-1]["dia"]
+    chave_mes = mes_ref(primeiro)
+
+    return {
+        "periodoMensal": {
+            "descricaoMes": chave_mes,
+            "rotuloAcumulado": f"{primeiro.strftime('%d/%m')} a {ultimo.strftime('%d/%m')}",
+            "consumoKwh": round(float(diarios["consumo_dia"].sum()), 0)
+        },
+        "historicoDiario": {
+            "dias": [dia.strftime("%d/%m") for dia in diarios["dia"].tolist()],
+            "custos": [round(float(valor), 2) for valor in diarios["custo_dia"].tolist()],
+            "diasProjecao": []
+        },
+        "alertasDiarios": {
+            "aviso": [int(v) for v in diarios["aviso"].tolist()],
+            "critico": [int(v) for v in diarios["critico"].tolist()]
+        },
+        "decomposicaoDiaria": {
+            "impactoConsumo": impacto_consumo,
+            "impactoTarifa": impacto_tarifa
+        },
+        "rankingNodes": {
+            "labels": ranking["hostname"].astype(str).tolist(),
+            "custos": [round(float(v), 2) for v in ranking["custo_total"].tolist()],
+            "consumosKwh": [round(float(v), 0) for v in ranking["consumo_total"].tolist()],
+            "alertasAvisoPorNode": [int(v) for v in ranking["aviso"].tolist()],
+            "alertasCriticoPorNode": [int(v) for v in ranking["critico"].tolist()]
+        },
+        "metricasMesAnterior": metricas_mes_anterior
+    }
+
+
+def publicar_billing_no_s3(s3, bucket, registros, inicio, fim):
+    if not registros:
+        return {"arquivos": 0, "empresas": 0, "meses": 0, "modo_saida": "s3", "aviso": None}
+
+    df = pd.DataFrame(registros)
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df["dia"] = df["timestamp"].dt.normalize()
+    serie_mes = df["timestamp"]
+    if getattr(serie_mes.dt, "tz", None) is not None:
+        serie_mes = serie_mes.dt.tz_localize(None)
+    df["mes"] = serie_mes.dt.to_period("M").astype(str)
+    df = sintetizar_alertas_billing(df)
+    estado_saida = {"modo": "s3", "motivo": None}
+
+    total_arquivos = 0
+    total_meses = 0
+    empresas = sorted(df["id_empresa"].dropna().astype(int).unique().tolist())
+
+    for id_empresa in empresas:
+        base_empresa = df[df["id_empresa"].astype(int) == int(id_empresa)].copy()
+        meses = sorted(base_empresa["mes"].dropna().unique().tolist())
+        metricas_por_mes = {}
+
+        for chave_mes in meses:
+            df_mes = base_empresa[base_empresa["mes"] == chave_mes].copy()
+            indice = meses.index(chave_mes)
+            mes_anterior = meses[indice - 1] if indice > 0 else None
+            metricas_mes_anterior = metricas_por_mes.get(mes_anterior)
+            payload = montar_payload_mes(df_mes, metricas_mes_anterior)
+            if not payload:
+                continue
+
+            metricas_por_mes[chave_mes] = calcular_metricas_periodo(payload)
+            chave_resumo = f"{BILLING_GOLD_PREFIX}/empresa={id_empresa}/mes={chave_mes}/resumo.json"
+            gravar_billing_saida(s3, bucket, chave_resumo, payload, estado_saida)
+            total_arquivos += 1
+            total_meses += 1
+
+        chave_meses = f"{BILLING_GOLD_PREFIX}/empresa={id_empresa}/meses.json"
+        gravar_billing_saida(s3, bucket, chave_meses, {
+            "empresa": int(id_empresa),
+            "meses": meses,
+            "gerado_em": pd.Timestamp.now(tz=FUSO)
+        }, estado_saida)
+        total_arquivos += 1
+
+    return {
+        "arquivos": total_arquivos,
+        "empresas": len(empresas),
+        "meses": total_meses,
+        "modo_saida": estado_saida["modo"],
+        "aviso": estado_saida["motivo"]
+    }
+
+
+def executar_billing():
+    agora = pd.Timestamp.now(tz=FUSO)
+    inicio, fim = janela_billing(BILLING_MODO, agora)
+
+    s3 = boto3.client("s3", region_name=os.getenv("AWS_REGION", os.getenv("REGION_NAME", "us-east-1")))
+    bucket = os.environ["BUCKET_NAME"]
+
+    try:
+        df = carregar_silver_billing(s3, bucket, agora, inicio=inicio, colunas=COLUNAS)
+    except ClientError as erro:
+        if erro.response.get("Error", {}).get("Code") in ("AccessDenied", "AllAccessDisabled"):
+            print("Billing: sem permissão de listagem no S3; usando Silver local.")
+            df = carregar_silver_billing_local(agora, inicio=inicio, colunas=COLUNAS)
+        else:
+            raise
+
+    if df.empty:
+        raise ValueError("Sem hosts na Silver para montar o Billing.")
+
+    catalogo = catalogo_billing_de_dataframe(df)
+    parametros = parametros_billing_padrao(catalogo)
+
+    registros_sinteticos = montar_registros_billing_sinteticos(catalogo, parametros, inicio, fim)
+    registros_reais = montar_registros_billing_reais(df, catalogo, parametros)
+    registros = mesclar_registros_billing(registros_sinteticos, registros_reais)
+
+    resultado = publicar_billing_no_s3(s3, bucket, registros, inicio, fim)
+    return {
+        "modo": BILLING_MODO,
+        "inicio": inicio.isoformat(),
+        "fim": fim.isoformat(),
+        "nodes": len(catalogo),
+        "registros_processados": len(registros),
+        "arquivos_publicados": resultado["arquivos"],
+        "empresas": resultado["empresas"],
+        "meses": resultado["meses"],
+        "modo_saida": resultado.get("modo_saida", "s3"),
+        "aviso": resultado.get("aviso"),
+    }
+
+
+def lambda_handler_billing(event, context):
+    for variavel in ("BUCKET_NAME",):
+        if not os.getenv(variavel):
+            raise ValueError(f"Configure a variável {variavel} na Lambda.")
+
+    return executar_billing()
 
 
 # Este bloco só roda quando o arquivo é executado direto (python arquivo.py).

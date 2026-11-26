@@ -4,6 +4,7 @@ Configure ETL_MODULO para selecionar a ETL.
 Use bronze2silver para a Bronze, silver2gold para o gestor,
 silver2gold_operador para o operador (silver2goldOperador também é aceito) ou
 silver2gold_analista para o analista (silver2goldAnalista também é aceito).
+Para Billing no MySQL, use silver2gold_billing (silver2billing também é aceito).
 Para outros módulos, use o nome do arquivo sem .py.
 """
 import importlib
@@ -24,6 +25,11 @@ def lambda_handler(event, context):
         from silver2gold import lambda_handler_analista
 
         return lambda_handler_analista(event, context)
+
+    if nome_modulo in ("silver2gold_billing", "silver2billing"):
+        from silver2gold import lambda_handler_billing
+
+        return lambda_handler_billing(event, context)
 
     etl = importlib.import_module(nome_modulo)
     executar = getattr(etl, "lambda_handler", None)
