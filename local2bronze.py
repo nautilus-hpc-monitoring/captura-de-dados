@@ -10,9 +10,11 @@ from getpass import getpass
 from datetime import timezone
 from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError
 from boto3.exceptions import S3UploadFailedError
+from injecao_incidentes import InjetorIncidentes, gravar_rotulos
 
-host = socket.gethostname()
-url_auth = os.getenv('AUTH_URL', 'http://localhost:3000/auth/').rstrip('/')
+host = os.getenv('AUTH_HOSTNAME', 'alpha-node01').strip()
+injetor = InjetorIncidentes(host)
+url_auth = os.getenv('AUTH_URL', 'http://localhost:8080/auth/').rstrip('/')
 url_credenciais = url_auth + '/credenciais'
 credenciais_login = None
 
@@ -199,7 +201,7 @@ def upload_file(file_name, bucket, object_name):
 INTERVALO = 10  
 LOTE = 6 
 
-def enviar_lote(linhas):
+def enviar_lote(linhas, rotulos=None):
     momento = datetime.now()
     nome_caminho = f'data_{momento:%Y%m%d_%H%M%S}.csv'
     caminho_local = f'./{nome_caminho}'
@@ -217,12 +219,24 @@ def enviar_lote(linhas):
         writer.writerows(linhas)
 
     try:
-        return upload_file(caminho_local, os.getenv('BUCKET_NAME'), objeto)
+        if injetor.dry_run:
+            injetor.dry_run_dir.mkdir(parents=True, exist_ok=True)
+            os.replace(caminho_local, injetor.dry_run_dir / nome_caminho)
+            enviado = True
+        else:
+            enviado = upload_file(caminho_local, os.getenv('BUCKET_NAME'), objeto)
     finally:
-        os.remove(caminho_local)
+        if not injetor.dry_run and os.path.exists(caminho_local):
+            os.remove(caminho_local)
+
+    if enviado and injetor.ativo and rotulos:
+        diretorio = injetor.dry_run_dir if injetor.dry_run else injetor.rotulos_dir
+        gravar_rotulos(diretorio, nome_caminho, rotulos)
+    return enviado
 
 def escrita():
     dados = []
+    rotulos = []
 
     try:
         while True:
@@ -244,13 +258,19 @@ def escrita():
                 *disco
             ]
 
+            linha, rotulo = injetor.processar(linha)
+
             print(linha)
             dados.append(linha)
+            rotulos.append(rotulo)
+
+            injetor.salvar_estado()
 
             if len(dados) >= LOTE:
-                if enviar_lote(dados):
+                if enviar_lote(dados, rotulos):
                     print(f'\nLote de {len(dados)} linhas enviado com sucesso!\n')
                     dados = []
+                    rotulos = []
                 else:
                     print('Falha no envio, as linhas continuam em dados e vão no próximo lote')
 
@@ -258,7 +278,7 @@ def escrita():
 
     except KeyboardInterrupt:
         if dados:
-            enviar_lote(dados)
+            enviar_lote(dados, rotulos)
         print('\nMonitoramento encerrado')
 
 if __name__ == '__main__':
@@ -270,7 +290,7 @@ if __name__ == '__main__':
     print(start_msg)
 
     email = input('Email: ')
-    password = getpass('Senha: ')
+    password = input('Senha: ')
     credenciais_login = {'email': email, 'senha': password, 'hostname': host}
 
     try:
@@ -280,7 +300,8 @@ if __name__ == '__main__':
                 'email': email,
                 'senha': password,
                 'hostname': host
-            }
+            },
+            timeout=(5, 15)
         )
         res.raise_for_status()
 
@@ -295,7 +316,7 @@ if __name__ == '__main__':
             print('Falha na autenticação! Email e/ou senha incorretos')
 
     except requests.exceptions.HTTPError as erro:
-        print('Erro na autenticação:', erro)
+        print('Erro na autenticação:', erro, erro.response.text if erro.response is not None else '')
 
 
     except requests.exceptions.RequestException as erro:
