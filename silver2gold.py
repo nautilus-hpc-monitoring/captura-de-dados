@@ -66,6 +66,11 @@ BILLING_PRECO_API = os.getenv("BILLING_PRECO_API", "https://api.energy-charts.in
 BILLING_PRECO_BZN = os.getenv("BILLING_PRECO_BZN", "DE-LU")
 BILLING_EUR_BRL = float(os.getenv("BILLING_EUR_BRL", "6.00"))
 BILLING_PRECO_FALLBACK_KWH = float(os.getenv("BILLING_PRECO_FALLBACK_KWH", "0.85"))
+BILLING_PARAMS_URL = os.getenv("BILLING_PARAMS_URL", os.getenv("AUTH_URL", "http://localhost:3333/auth/").rstrip("/") + "/billing-parametros")
+BILLING_AUTH_EMAIL = os.getenv("BILLING_AUTH_EMAIL", os.getenv("AUTH_EMAIL", "")).strip()
+BILLING_AUTH_SENHA = os.getenv("BILLING_AUTH_SENHA", os.getenv("AUTH_PASSWORD", ""))
+BILLING_AUTH_HOSTNAME = os.getenv("BILLING_AUTH_HOSTNAME", os.getenv("AUTH_HOSTNAME", "alpha-node01")).strip()
+BILLING_ETL_API_KEY = os.getenv("ETL_API_KEY", "blablabla").strip()
 BILLING_HOSTNAMES_DEMO = [
     "alpha-node01", "alpha-node02", "alpha-node03", "alpha-node04", "alpha-node05",
     "beta-node01", "beta-node02", "beta-node03", "beta-node04", "beta-node05",
@@ -2847,7 +2852,8 @@ def lambda_handler_operador(event, context):
 
 
 # ---------------------------------------------------------------------------
-# ETL BILLING: lê Silver e grava billing_node_horario no MySQL.
+# ETL BILLING: lê Silver e publica JSON na Gold (S3/local), usando parâmetros
+# de billing vindos da API do site quando disponíveis.
 # ---------------------------------------------------------------------------
 def ano_referencia_setembro(agora):
     inicio_ano = pd.Timestamp(year=agora.year, month=9, day=1, tz=FUSO)
@@ -2962,6 +2968,97 @@ def parametros_billing_padrao(catalogo):
             "encargos_kwh": round(0.090000 + (id_node % 4) * 0.018000, 6),
             "tarifa_fallback_kwh": round(0.780000 + (id_node % 5) * 0.040000, 6),
         }
+    return parametros
+
+
+def carregar_parametros_billing_api(catalogo):
+    if not catalogo:
+        return {}
+
+    if not BILLING_AUTH_EMAIL or not BILLING_AUTH_SENHA:
+        print("Billing: credenciais de API ausentes; usando parâmetros locais padrão.")
+        return {}
+
+    if not BILLING_ETL_API_KEY:
+        print("Billing: ETL_API_KEY ausente; usando parâmetros locais padrão.")
+        return {}
+
+    hostnames = sorted({str(info.get("hostname", "")).strip() for info in catalogo.values() if str(info.get("hostname", "")).strip()})
+    if not hostnames:
+        return {}
+
+    payload = {
+        "email": BILLING_AUTH_EMAIL,
+        "senha": BILLING_AUTH_SENHA,
+        "hostname": BILLING_AUTH_HOSTNAME,
+        "hostnames": hostnames,
+    }
+    headers = {"x-etl-api-key": BILLING_ETL_API_KEY}
+
+    try:
+        resposta = requests.post(BILLING_PARAMS_URL, json=payload, headers=headers, timeout=(5, 20))
+    except requests.RequestException as erro:
+        print(f"Billing: falha ao consultar parâmetros no site ({type(erro).__name__}); usando parâmetros locais padrão.")
+        return {}
+
+    if resposta.status_code != 200:
+        print(f"Billing: endpoint de parâmetros retornou HTTP {resposta.status_code}; usando parâmetros locais padrão.")
+        return {}
+
+    try:
+        dados = resposta.json()
+    except ValueError:
+        print("Billing: resposta inválida do endpoint de parâmetros; usando parâmetros locais padrão.")
+        return {}
+
+    linhas = dados.get("parametros")
+    if not isinstance(linhas, list):
+        print("Billing: endpoint sem lista de parâmetros; usando parâmetros locais padrão.")
+        return {}
+
+    parametros_por_host = {}
+    for linha in linhas:
+        hostname = str(linha.get("hostname", "")).strip()
+        if not hostname:
+            continue
+        try:
+            parametro = {
+                "potencia_idle_kw": float(linha["potencia_idle_kw"]),
+                "potencia_max_kw": float(linha["potencia_max_kw"]),
+                "fator_gamma": float(linha["fator_gamma"]),
+                "tarifa_alpha": float(linha["tarifa_alpha"]),
+                "tarifa_beta": float(linha["tarifa_beta"]),
+                "encargos_kwh": float(linha["encargos_kwh"]),
+                "tarifa_fallback_kwh": float(linha["tarifa_fallback_kwh"]),
+            }
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        if parametro["potencia_idle_kw"] < 0:
+            continue
+        if parametro["potencia_max_kw"] < parametro["potencia_idle_kw"]:
+            continue
+        if parametro["fator_gamma"] <= 0:
+            continue
+        if parametro["tarifa_alpha"] < 0 or parametro["encargos_kwh"] < 0 or parametro["tarifa_fallback_kwh"] < 0:
+            continue
+
+        parametros_por_host[hostname] = parametro
+
+    if not parametros_por_host:
+        print("Billing: nenhum parâmetro válido retornado pelo endpoint; usando parâmetros locais padrão.")
+        return {}
+
+    parametros = {}
+    for info in catalogo.values():
+        hostname = str(info.get("hostname", "")).strip()
+        id_node = int(info.get("id_node", 0))
+        parametro = parametros_por_host.get(hostname)
+        if id_node > 0 and parametro:
+            parametros[id_node] = parametro
+
+    if parametros:
+        print(f"Billing: {len(parametros)} nodes com parâmetros vindos do site.")
     return parametros
 
 
@@ -3356,6 +3453,9 @@ def executar_billing():
         print("Billing: sem dados reais até 15/11; usando histórico sintético para o período da apresentação.")
 
     parametros = parametros_billing_padrao(catalogo)
+    parametros_api = carregar_parametros_billing_api(catalogo)
+    if parametros_api:
+        parametros.update(parametros_api)
 
     registros_sinteticos = montar_registros_billing_sinteticos(catalogo, parametros, inicio, fim, mapa_tarifas)
     registros_reais = montar_registros_billing_reais(df_reais_ate_limite, catalogo, parametros, mapa_tarifas)
