@@ -2973,19 +2973,19 @@ def parametros_billing_padrao(catalogo):
 
 def carregar_parametros_billing_api(catalogo):
     if not catalogo:
-        return {}
+        return {"parametros": {}, "empresa_id": None}
 
     if not BILLING_AUTH_EMAIL or not BILLING_AUTH_SENHA:
         print("Billing: credenciais de API ausentes; usando parâmetros locais padrão.")
-        return {}
+        return {"parametros": {}, "empresa_id": None}
 
     if not BILLING_ETL_API_KEY:
         print("Billing: ETL_API_KEY ausente; usando parâmetros locais padrão.")
-        return {}
+        return {"parametros": {}, "empresa_id": None}
 
     hostnames = sorted({str(info.get("hostname", "")).strip() for info in catalogo.values() if str(info.get("hostname", "")).strip()})
     if not hostnames:
-        return {}
+        return {"parametros": {}, "empresa_id": None}
 
     payload = {
         "email": BILLING_AUTH_EMAIL,
@@ -2999,22 +2999,30 @@ def carregar_parametros_billing_api(catalogo):
         resposta = requests.post(BILLING_PARAMS_URL, json=payload, headers=headers, timeout=(5, 20))
     except requests.RequestException as erro:
         print(f"Billing: falha ao consultar parâmetros no site ({type(erro).__name__}); usando parâmetros locais padrão.")
-        return {}
+        return {"parametros": {}, "empresa_id": None}
 
     if resposta.status_code != 200:
         print(f"Billing: endpoint de parâmetros retornou HTTP {resposta.status_code}; usando parâmetros locais padrão.")
-        return {}
+        return {"parametros": {}, "empresa_id": None}
 
     try:
         dados = resposta.json()
     except ValueError:
         print("Billing: resposta inválida do endpoint de parâmetros; usando parâmetros locais padrão.")
-        return {}
+        return {"parametros": {}, "empresa_id": None}
+
+    empresa_id_api = None
+    try:
+        empresa_id_lida = int(dados.get("empresa_id"))
+        if empresa_id_lida > 0:
+            empresa_id_api = empresa_id_lida
+    except (TypeError, ValueError):
+        empresa_id_api = None
 
     linhas = dados.get("parametros")
     if not isinstance(linhas, list):
         print("Billing: endpoint sem lista de parâmetros; usando parâmetros locais padrão.")
-        return {}
+        return {"parametros": {}, "empresa_id": empresa_id_api}
 
     parametros_por_host = {}
     for linha in linhas:
@@ -3047,7 +3055,7 @@ def carregar_parametros_billing_api(catalogo):
 
     if not parametros_por_host:
         print("Billing: nenhum parâmetro válido retornado pelo endpoint; usando parâmetros locais padrão.")
-        return {}
+        return {"parametros": {}, "empresa_id": empresa_id_api}
 
     parametros = {}
     for info in catalogo.values():
@@ -3059,7 +3067,7 @@ def carregar_parametros_billing_api(catalogo):
 
     if parametros:
         print(f"Billing: {len(parametros)} nodes com parâmetros vindos do site.")
-    return parametros
+    return {"parametros": parametros, "empresa_id": empresa_id_api}
 
 
 def carregar_tarifas_energia_externa(inicio, fim):
@@ -3453,7 +3461,13 @@ def executar_billing():
         print("Billing: sem dados reais até 15/11; usando histórico sintético para o período da apresentação.")
 
     parametros = parametros_billing_padrao(catalogo)
-    parametros_api = carregar_parametros_billing_api(catalogo)
+    resposta_parametros_api = carregar_parametros_billing_api(catalogo)
+    parametros_api = resposta_parametros_api.get("parametros", {})
+    empresa_id_api = resposta_parametros_api.get("empresa_id")
+    if isinstance(empresa_id_api, int) and empresa_id_api > 0:
+        for info in catalogo.values():
+            info["id_empresa"] = empresa_id_api
+        print(f"Billing: empresa autenticada na API = {empresa_id_api}; IDs de empresa sincronizados no catálogo.")
     if parametros_api:
         parametros.update(parametros_api)
 
