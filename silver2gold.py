@@ -21,6 +21,7 @@ import io
 import json
 import math
 import os
+import sys
 import tempfile
 import zlib
 from datetime import datetime, timedelta
@@ -31,6 +32,7 @@ from zoneinfo import ZoneInfo
 import boto3
 import numpy as np
 import pandas as pd
+import requests
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 
@@ -51,15 +53,26 @@ OPERADOR_LIMITE_CRITICO = float(os.getenv("OPERADOR_LIMITE_CRITICO", "90"))
 OPERADOR_COLUNAS = list(COLUNAS) + ["DISCO_PERCENT"]
 
 # ETL Billing (Silver -> Gold Billing)
-# Sempre roda em modo híbrido: gera histórico sintético e sobrepõe as horas reais.
-BILLING_MODO = "hibrido"
+# Modo fixo real: usa somente telemetria real da Silver.
+BILLING_MODO = "real"
 BILLING_DIAS_REAL = int(os.getenv("BILLING_DIAS_REAL", "90"))
 BILLING_TARIFA_BASE = float(os.getenv("BILLING_TARIFA_BASE", "0.44"))
 BILLING_TARIFA_AMPLITUDE = float(os.getenv("BILLING_TARIFA_AMPLITUDE", "0.18"))
 BILLING_ADICIONAL_PICO = float(os.getenv("BILLING_ADICIONAL_PICO", "0.16"))
-BILLING_GERAR_ALERTAS = os.getenv("BILLING_GERAR_ALERTAS", "true") == "true"
+BILLING_GERAR_ALERTAS = True
 BILLING_ORIGEM_ALERTA = "[billing-etl]"
 BILLING_GOLD_PREFIX = os.getenv("BILLING_GOLD_PREFIX", "03-gold/billing").rstrip("/")
+BILLING_PRECO_API = os.getenv("BILLING_PRECO_API", "https://api.energy-charts.info/price")
+BILLING_PRECO_BZN = os.getenv("BILLING_PRECO_BZN", "DE-LU")
+BILLING_EUR_BRL = float(os.getenv("BILLING_EUR_BRL", "6.00"))
+BILLING_PRECO_FALLBACK_KWH = float(os.getenv("BILLING_PRECO_FALLBACK_KWH", "0.85"))
+BILLING_HOSTNAMES_DEMO = [
+    "alpha-node01", "alpha-node02", "alpha-node03", "alpha-node04", "alpha-node05",
+    "beta-node01", "beta-node02", "beta-node03", "beta-node04", "beta-node05",
+    "gamma-node01", "gamma-node02", "gamma-node03", "gamma-node04", "gamma-node05",
+    "delta-node01", "delta-node02", "delta-node03",
+    "epsilon-node01", "epsilon-node02", "epsilon-node03"
+]
 
 
 # 1. CADASTRO: nodes informados na configuração ou consultados no banco.
@@ -2850,6 +2863,12 @@ def janela_billing(modo, agora):
     return agora - pd.Timedelta(days=BILLING_DIAS_REAL), agora
 
 
+def limite_demo_projecao(agora):
+    # Mantém novembro incompleto para exibir a linha de projeção na apresentação.
+    limite = pd.Timestamp(year=agora.year, month=11, day=15, hour=23, minute=0, second=0, tz=FUSO)
+    return min(agora.floor("1h"), limite)
+
+
 def mesclar_registros_billing(registros_sinteticos, registros_reais):
     # Chave por node+hora. Dados reais sempre sobrescrevem o sintético.
     mapa = {}
@@ -2869,9 +2888,40 @@ def mesclar_registros_billing(registros_sinteticos, registros_reais):
     return registros
 
 
+def expandir_df_para_hosts_demo(df, hosts_demo):
+    if df.empty:
+        return df
+
+    base_hosts = sorted(df["HOSTNAME"].dropna().astype(str).unique().tolist())
+    if not base_hosts:
+        return df
+
+    partes = []
+    for idx, host_destino in enumerate(hosts_demo):
+        host_origem = base_hosts[idx % len(base_hosts)]
+        base = df[df["HOSTNAME"].astype(str) == host_origem].copy()
+        if base.empty:
+            continue
+
+        fator = 0.78 + ((idx % 9) * 0.11)
+        offset = -8 + ((idx % 7) * 2.2)
+        ajuste_hora = np.sin((base["TIMESTAMP"].dt.hour.astype(float) + idx) * (2 * np.pi / 24.0)) * (3 + (idx % 4))
+
+        cpu = pd.to_numeric(base["CPU_PERCENT"], errors="coerce").fillna(0)
+        base["CPU_PERCENT"] = (cpu * fator + offset + ajuste_hora).clip(3, 100).round(2)
+        base["HOSTNAME"] = host_destino
+        partes.append(base)
+
+    if not partes:
+        return df
+
+    expandido = pd.concat(partes, ignore_index=True)
+    return expandido.sort_values(["HOSTNAME", "TIMESTAMP"]).reset_index(drop=True)
+
+
 def catalogo_billing_de_dataframe(df):
     empresa_padrao = int(os.getenv("BILLING_EMPRESA_PADRAO", "1"))
-    hosts = sorted(df["HOSTNAME"].dropna().astype(str).unique().tolist())
+    hosts = BILLING_HOSTNAMES_DEMO
     empresas_por_host = {}
     if "EMPRESA_ID" in df.columns:
         validos = df[["HOSTNAME", "EMPRESA_ID"]].dropna().copy()
@@ -2915,13 +2965,67 @@ def parametros_billing_padrao(catalogo):
     return parametros
 
 
-def tarifa_horaria(parametros, instante_hora):
-    base = BILLING_TARIFA_BASE
-    sazonal_anual = BILLING_TARIFA_AMPLITUDE * math.sin(2 * math.pi * (instante_hora.dayofyear / 365.0))
-    sazonal_mensal = 0.10 * math.sin(2 * math.pi * (instante_hora.day / 31.0))
-    pico = BILLING_ADICIONAL_PICO if 17 <= instante_hora.hour <= 21 else 0.0
+def carregar_tarifas_energia_externa(inicio, fim):
+    inicio_data = pd.Timestamp(inicio).tz_convert("UTC").date().isoformat()
+    fim_data = pd.Timestamp(fim).tz_convert("UTC").date().isoformat()
+
+    resposta = requests.get(
+        BILLING_PRECO_API,
+        params={
+            "bzn": BILLING_PRECO_BZN,
+            "start": inicio_data,
+            "end": fim_data,
+        },
+        timeout=(5, 20),
+    )
+    resposta.raise_for_status()
+    dados = resposta.json()
+
+    instantes = dados.get("unix_seconds") or []
+    precos = dados.get("price") or []
+    if not instantes or not precos:
+        raise ValueError("API de energia sem dados de preço.")
+
+    mapa = {}
+    for unix, preco in zip(instantes, precos):
+        if preco is None:
+            continue
+        try:
+            preco_eur_mwh = float(preco)
+        except (TypeError, ValueError):
+            continue
+
+        preco_eur_mwh = max(0.0, preco_eur_mwh)
+        preco_brl_kwh = (preco_eur_mwh / 1000.0) * BILLING_EUR_BRL
+
+        instante = pd.Timestamp(unix, unit="s", tz="UTC").tz_convert(FUSO).floor("h")
+        mapa[instante.isoformat()] = round(preco_brl_kwh, 6)
+
+    if not mapa:
+        raise ValueError("API de energia retornou preços inválidos.")
+    return mapa
+
+
+def montar_mapa_tarifas(inicio, fim):
+    try:
+        return carregar_tarifas_energia_externa(inicio, fim)
+    except Exception as erro:
+        print(f"Billing: API externa de energia indisponível ({type(erro).__name__}); usando fallback de tarifa.")
+        return {}
+
+
+def tarifa_base_hora(instante_hora, mapa_tarifas):
+    chave = pd.Timestamp(instante_hora).floor("h").isoformat()
+    tarifa = mapa_tarifas.get(chave)
+    if tarifa is not None and tarifa > 0:
+        return float(tarifa)
+    return BILLING_PRECO_FALLBACK_KWH
+
+
+def tarifa_horaria(parametros, instante_hora, mapa_tarifas):
+    tarifa_mercado = tarifa_base_hora(instante_hora, mapa_tarifas)
     tarifa = (
-        parametros["tarifa_alpha"] * (base + sazonal_anual + sazonal_mensal + pico)
+        parametros["tarifa_alpha"] * tarifa_mercado
         + parametros["tarifa_beta"]
         + parametros["encargos_kwh"]
     )
@@ -2929,12 +3033,12 @@ def tarifa_horaria(parametros, instante_hora):
     return max(piso, tarifa)
 
 
-def consumo_e_custo(cpu_percent, parametros, instante_hora):
+def consumo_e_custo(cpu_percent, parametros, instante_hora, mapa_tarifas):
     cpu = max(0.0, min(100.0, float(cpu_percent)))
     consumo = parametros["potencia_idle_kw"] + (
         parametros["potencia_max_kw"] - parametros["potencia_idle_kw"]
     ) * ((cpu / 100.0) ** parametros["fator_gamma"])
-    tarifa = tarifa_horaria(parametros, instante_hora)
+    tarifa = tarifa_horaria(parametros, instante_hora, mapa_tarifas)
     custo = consumo * tarifa
     return round(consumo, 4), round(tarifa, 6), round(custo, 2)
 
@@ -2952,7 +3056,7 @@ def gerar_cpu_sintetica(hostname, id_node, instante_hora):
     return round(max(3.0, min(100.0, valor)), 2)
 
 
-def montar_registros_billing_reais(df, catalogo, parametros):
+def montar_registros_billing_reais(df, catalogo, parametros, mapa_tarifas):
     registros = []
     for hostname, grupo in df.groupby("HOSTNAME"):
         info = catalogo.get(str(hostname))
@@ -2967,7 +3071,7 @@ def montar_registros_billing_reais(df, catalogo, parametros):
                  .mean()
                  .dropna())
         for instante_hora, cpu in serie.items():
-            consumo, tarifa, custo = consumo_e_custo(cpu, parametro, instante_hora)
+            consumo, tarifa, custo = consumo_e_custo(cpu, parametro, instante_hora, mapa_tarifas)
             registros.append({
                 "timestamp": instante_hora,
                 "media_cpu_pct": round(float(cpu), 2),
@@ -2981,7 +3085,7 @@ def montar_registros_billing_reais(df, catalogo, parametros):
     return registros
 
 
-def montar_registros_billing_sinteticos(catalogo, parametros, inicio, fim):
+def montar_registros_billing_sinteticos(catalogo, parametros, inicio, fim, mapa_tarifas):
     registros = []
     horas = pd.date_range(inicio, fim, freq="1h")
     for host, info in sorted(catalogo.items()):
@@ -2991,7 +3095,7 @@ def montar_registros_billing_sinteticos(catalogo, parametros, inicio, fim):
             continue
         for instante_hora in horas:
             cpu = gerar_cpu_sintetica(host, id_node, instante_hora)
-            consumo, tarifa, custo = consumo_e_custo(cpu, parametro, instante_hora)
+            consumo, tarifa, custo = consumo_e_custo(cpu, parametro, instante_hora, mapa_tarifas)
             registros.append({
                 "timestamp": instante_hora,
                 "media_cpu_pct": cpu,
@@ -3130,6 +3234,13 @@ def montar_payload_mes(df_mes, metricas_mes_anterior):
     primeiro = diarios.iloc[0]["dia"]
     ultimo = diarios.iloc[-1]["dia"]
     chave_mes = mes_ref(primeiro)
+    dias_no_mes = pd.Period(chave_mes, freq="M").days_in_month
+    ultimo_dia_mes = pd.Timestamp(year=int(primeiro.year), month=int(primeiro.month), day=int(dias_no_mes)).date()
+    ultimo_dia_real = pd.Timestamp(ultimo).date()
+    dias_projecao = []
+    if ultimo_dia_real < ultimo_dia_mes:
+        faixa_projecao = pd.date_range(ultimo_dia_real + pd.Timedelta(days=1), ultimo_dia_mes, freq="D")
+        dias_projecao = [dia.strftime("%d/%m") for dia in faixa_projecao.tolist()]
 
     return {
         "periodoMensal": {
@@ -3140,7 +3251,7 @@ def montar_payload_mes(df_mes, metricas_mes_anterior):
         "historicoDiario": {
             "dias": [dia.strftime("%d/%m") for dia in diarios["dia"].tolist()],
             "custos": [round(float(valor), 2) for valor in diarios["custo_dia"].tolist()],
-            "diasProjecao": []
+            "diasProjecao": dias_projecao
         },
         "alertasDiarios": {
             "aviso": [int(v) for v in diarios["aviso"].tolist()],
@@ -3218,10 +3329,13 @@ def publicar_billing_no_s3(s3, bucket, registros, inicio, fim):
 
 def executar_billing():
     agora = pd.Timestamp.now(tz=FUSO)
-    inicio, fim = janela_billing(BILLING_MODO, agora)
+    ano_ref = ano_referencia_setembro(agora)
+    inicio = pd.Timestamp(year=ano_ref, month=9, day=1, hour=0, minute=0, second=0, tz=FUSO)
+    fim = limite_demo_projecao(agora)
 
     s3 = boto3.client("s3", region_name=os.getenv("AWS_REGION", os.getenv("REGION_NAME", "us-east-1")))
     bucket = os.environ["BUCKET_NAME"]
+    mapa_tarifas = montar_mapa_tarifas(inicio, fim)
 
     try:
         df = carregar_silver_billing(s3, bucket, agora, inicio=inicio, colunas=COLUNAS)
@@ -3235,11 +3349,16 @@ def executar_billing():
     if df.empty:
         raise ValueError("Sem hosts na Silver para montar o Billing.")
 
+    df = expandir_df_para_hosts_demo(df, BILLING_HOSTNAMES_DEMO)
     catalogo = catalogo_billing_de_dataframe(df)
+    df_reais_ate_limite = df[df["TIMESTAMP"] <= fim].copy()
+    if df_reais_ate_limite.empty:
+        print("Billing: sem dados reais até 15/11; usando histórico sintético para o período da apresentação.")
+
     parametros = parametros_billing_padrao(catalogo)
 
-    registros_sinteticos = montar_registros_billing_sinteticos(catalogo, parametros, inicio, fim)
-    registros_reais = montar_registros_billing_reais(df, catalogo, parametros)
+    registros_sinteticos = montar_registros_billing_sinteticos(catalogo, parametros, inicio, fim, mapa_tarifas)
+    registros_reais = montar_registros_billing_reais(df_reais_ate_limite, catalogo, parametros, mapa_tarifas)
     registros = mesclar_registros_billing(registros_sinteticos, registros_reais)
 
     resultado = publicar_billing_no_s3(s3, bucket, registros, inicio, fim)
@@ -3265,10 +3384,54 @@ def lambda_handler_billing(event, context):
     return executar_billing()
 
 
+def executar_todas_dashboards():
+    pipelines = [
+        ("gestor", executar),
+        ("operador", executar_operador),
+        ("analista", executar_analista),
+        ("categorizacao", executar_categorizacao),
+        ("billing", executar_billing),
+    ]
+
+    resumo = {"sucesso": {}, "falhas": {}}
+    for nome, funcao in pipelines:
+        try:
+            print(f"\n--- ETL {nome}: iniciando ---")
+            retorno = funcao()
+            resumo["sucesso"][nome] = retorno
+            print(f"--- ETL {nome}: concluída ---")
+        except Exception as erro:
+            resumo["falhas"][nome] = f"{type(erro).__name__}: {erro}"
+            print(f"--- ETL {nome}: falhou ({type(erro).__name__}) ---")
+
+    print("\nResumo ETL:")
+    print(json.dumps(resumo, ensure_ascii=False, default=str, indent=2))
+    return resumo
+
+
+def executar_por_alvo(alvo):
+    alvo = (alvo or "todas").strip().lower()
+    if alvo in ("todas", "all"):
+        return executar_todas_dashboards()
+
+    mapa = {
+        "gestor": executar,
+        "operador": executar_operador,
+        "analista": executar_analista,
+        "categorizacao": executar_categorizacao,
+        "billing": executar_billing,
+    }
+    if alvo not in mapa:
+        raise ValueError("Alvo inválido. Use: todas, gestor, operador, analista, categorizacao ou billing.")
+    retorno = mapa[alvo]()
+    print(json.dumps({alvo: retorno}, ensure_ascii=False, default=str, indent=2))
+    return {"sucesso": {alvo: retorno}, "falhas": {}}
+
+
 # Este bloco só roda quando o arquivo é executado direto (python arquivo.py).
 # Quando outro script importa este módulo, nada aqui é executado.
 if __name__ == "__main__":
-    if MODO_LOCAL:
-        executar_analista()
-    else:
-        executar()
+    alvo_cli = sys.argv[1] if len(sys.argv) > 1 else "todas"
+    resultado = executar_por_alvo(alvo_cli)
+    if resultado.get("falhas"):
+        raise SystemExit(1)
