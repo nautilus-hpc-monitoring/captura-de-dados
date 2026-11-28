@@ -59,18 +59,26 @@ BILLING_DIAS_REAL = int(os.getenv("BILLING_DIAS_REAL", "90"))
 BILLING_TARIFA_BASE = float(os.getenv("BILLING_TARIFA_BASE", "0.44"))
 BILLING_TARIFA_AMPLITUDE = float(os.getenv("BILLING_TARIFA_AMPLITUDE", "0.18"))
 BILLING_ADICIONAL_PICO = float(os.getenv("BILLING_ADICIONAL_PICO", "0.16"))
-BILLING_GERAR_ALERTAS = True
 BILLING_ORIGEM_ALERTA = "[billing-etl]"
 BILLING_GOLD_PREFIX = os.getenv("BILLING_GOLD_PREFIX", "03-gold/billing").rstrip("/")
 BILLING_PRECO_API = os.getenv("BILLING_PRECO_API", "https://api.energy-charts.info/price")
 BILLING_PRECO_BZN = os.getenv("BILLING_PRECO_BZN", "DE-LU")
 BILLING_EUR_BRL = float(os.getenv("BILLING_EUR_BRL", "6.00"))
 BILLING_PRECO_FALLBACK_KWH = float(os.getenv("BILLING_PRECO_FALLBACK_KWH", "0.85"))
+# Flags fixas no código (mesma ideia do USAR_DADOS_MOCKADOS no front).
+BILLING_USAR_DADOS_SINTETICOS = True
+BILLING_EXPANDIR_HOSTS_DEMO = False
+BILLING_SINTETICO_ATE_1512 = True
+BILLING_CORTAR_GRAFICO1_1512 = True
+BILLING_EXIGIR_PARAMETROS_API = True
+# Quando ativo, o custo sintético fica estável entre execuções (usa tarifa fallback fixa).
+BILLING_FIXAR_CUSTO_SINTETICO = True
 BILLING_PARAMS_URL = os.getenv("BILLING_PARAMS_URL", os.getenv("AUTH_URL", "http://localhost:3333/auth/").rstrip("/") + "/billing-parametros")
 BILLING_AUTH_EMAIL = os.getenv("BILLING_AUTH_EMAIL", os.getenv("AUTH_EMAIL", "")).strip()
 BILLING_AUTH_SENHA = os.getenv("BILLING_AUTH_SENHA", os.getenv("AUTH_PASSWORD", ""))
-BILLING_AUTH_HOSTNAME = os.getenv("BILLING_AUTH_HOSTNAME", os.getenv("AUTH_HOSTNAME", "alpha-node01")).strip()
+BILLING_AUTH_HOSTNAME = os.getenv("BILLING_AUTH_HOSTNAME", os.getenv("AUTH_HOSTNAME", "")).strip()
 BILLING_ETL_API_KEY = os.getenv("ETL_API_KEY", "blablabla").strip()
+AUTH_CONTEXT_FILE = Path(__file__).resolve().parent / "silver_local" / ".auth_context.json"
 BILLING_HOSTNAMES_DEMO = [
     "alpha-node01", "alpha-node02", "alpha-node03", "alpha-node04", "alpha-node05",
     "beta-node01", "beta-node02", "beta-node03", "beta-node04", "beta-node05",
@@ -2869,8 +2877,10 @@ def janela_billing(modo, agora):
     return agora - pd.Timedelta(days=BILLING_DIAS_REAL), agora
 
 
-def limite_demo_projecao(agora):
-    # Mantém novembro incompleto para exibir a linha de projeção na apresentação.
+def limite_sintetico_billing(agora):
+    if not BILLING_SINTETICO_ATE_1512:
+        return agora.floor("1h")
+
     limite = pd.Timestamp(year=agora.year, month=11, day=15, hour=23, minute=0, second=0, tz=FUSO)
     return min(agora.floor("1h"), limite)
 
@@ -2927,7 +2937,7 @@ def expandir_df_para_hosts_demo(df, hosts_demo):
 
 def catalogo_billing_de_dataframe(df):
     empresa_padrao = int(os.getenv("BILLING_EMPRESA_PADRAO", "1"))
-    hosts = BILLING_HOSTNAMES_DEMO
+    hosts = sorted(df["HOSTNAME"].dropna().astype(str).str.strip().unique().tolist())
     empresas_por_host = {}
     if "EMPRESA_ID" in df.columns:
         validos = df[["HOSTNAME", "EMPRESA_ID"]].dropna().copy()
@@ -2955,6 +2965,35 @@ def catalogo_billing_de_dataframe(df):
     return catalogo
 
 
+def resposta_parametros_api_vazia():
+    return {"parametros": {}, "empresa_id": None, "hostnames_empresa": [], "catalogo_api": {}}
+
+
+def tratar_erro_parametros_api(mensagem):
+    if BILLING_EXIGIR_PARAMETROS_API:
+        raise ValueError(f"Billing: {mensagem}.")
+    print(f"Billing: {mensagem}; usando parâmetros locais padrão.")
+    return resposta_parametros_api_vazia()
+
+
+def carregar_contexto_auth_local():
+    if not AUTH_CONTEXT_FILE.exists():
+        return {}
+    try:
+        dados = json.loads(AUTH_CONTEXT_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return dados if isinstance(dados, dict) else {}
+
+
+def obter_credenciais_api_billing():
+    contexto = carregar_contexto_auth_local()
+    email = BILLING_AUTH_EMAIL or str(contexto.get("email", "")).strip()
+    senha = BILLING_AUTH_SENHA or str(contexto.get("senha", ""))
+    hostname = BILLING_AUTH_HOSTNAME or str(contexto.get("hostname", "")).strip()
+    return {"email": email, "senha": senha, "hostname": hostname}
+
+
 def parametros_billing_padrao(catalogo):
     parametros = {}
     for info in catalogo.values():
@@ -2971,45 +3010,46 @@ def parametros_billing_padrao(catalogo):
     return parametros
 
 
-def carregar_parametros_billing_api(catalogo):
-    if not catalogo:
-        return {"parametros": {}, "empresa_id": None}
+def carregar_parametros_billing_api(catalogo=None):
+    credenciais_api = obter_credenciais_api_billing()
+    email_api = credenciais_api["email"]
+    senha_api = credenciais_api["senha"]
+    hostname_api = credenciais_api["hostname"]
 
-    if not BILLING_AUTH_EMAIL or not BILLING_AUTH_SENHA:
-        print("Billing: credenciais de API ausentes; usando parâmetros locais padrão.")
-        return {"parametros": {}, "empresa_id": None}
+    if not email_api or not senha_api:
+        return tratar_erro_parametros_api("credenciais de API ausentes")
+
+    if not hostname_api:
+        return tratar_erro_parametros_api("hostname de autenticação ausente")
 
     if not BILLING_ETL_API_KEY:
-        print("Billing: ETL_API_KEY ausente; usando parâmetros locais padrão.")
-        return {"parametros": {}, "empresa_id": None}
+        return tratar_erro_parametros_api("ETL_API_KEY ausente")
 
-    hostnames = sorted({str(info.get("hostname", "")).strip() for info in catalogo.values() if str(info.get("hostname", "")).strip()})
-    if not hostnames:
-        return {"parametros": {}, "empresa_id": None}
+    hostnames = []
+    if isinstance(catalogo, dict) and catalogo:
+        hostnames = sorted({str(info.get("hostname", "")).strip() for info in catalogo.values() if str(info.get("hostname", "")).strip()})
 
     payload = {
-        "email": BILLING_AUTH_EMAIL,
-        "senha": BILLING_AUTH_SENHA,
-        "hostname": BILLING_AUTH_HOSTNAME,
-        "hostnames": hostnames,
+        "email": email_api,
+        "senha": senha_api,
+        "hostname": hostname_api,
     }
+    if hostnames:
+        payload["hostnames"] = hostnames
     headers = {"x-etl-api-key": BILLING_ETL_API_KEY}
 
     try:
         resposta = requests.post(BILLING_PARAMS_URL, json=payload, headers=headers, timeout=(5, 20))
     except requests.RequestException as erro:
-        print(f"Billing: falha ao consultar parâmetros no site ({type(erro).__name__}); usando parâmetros locais padrão.")
-        return {"parametros": {}, "empresa_id": None}
+        return tratar_erro_parametros_api(f"falha ao consultar parâmetros no site ({type(erro).__name__})")
 
     if resposta.status_code != 200:
-        print(f"Billing: endpoint de parâmetros retornou HTTP {resposta.status_code}; usando parâmetros locais padrão.")
-        return {"parametros": {}, "empresa_id": None}
+        return tratar_erro_parametros_api(f"endpoint de parâmetros retornou HTTP {resposta.status_code}")
 
     try:
         dados = resposta.json()
     except ValueError:
-        print("Billing: resposta inválida do endpoint de parâmetros; usando parâmetros locais padrão.")
-        return {"parametros": {}, "empresa_id": None}
+        return tratar_erro_parametros_api("resposta inválida do endpoint de parâmetros")
 
     empresa_id_api = None
     try:
@@ -3021,14 +3061,32 @@ def carregar_parametros_billing_api(catalogo):
 
     linhas = dados.get("parametros")
     if not isinstance(linhas, list):
-        print("Billing: endpoint sem lista de parâmetros; usando parâmetros locais padrão.")
-        return {"parametros": {}, "empresa_id": empresa_id_api}
+        return tratar_erro_parametros_api("endpoint sem lista de parâmetros")
 
-    parametros_por_host = {}
+    hostnames_empresa = sorted({
+        str(linha.get("hostname", "")).strip()
+        for linha in linhas
+        if str(linha.get("hostname", "")).strip()
+    })
+
+    parametros_por_id = {}
+    catalogo_api = {}
     for linha in linhas:
         hostname = str(linha.get("hostname", "")).strip()
         if not hostname:
             continue
+        try:
+            id_node_lido = int(linha.get("id_node"))
+            if id_node_lido <= 0:
+                continue
+        except (TypeError, ValueError):
+            continue
+
+        catalogo_api[hostname] = {
+            "id_node": id_node_lido,
+            "hostname": hostname,
+        }
+
         try:
             parametro = {
                 "potencia_idle_kw": float(linha["potencia_idle_kw"]),
@@ -3051,23 +3109,18 @@ def carregar_parametros_billing_api(catalogo):
         if parametro["tarifa_alpha"] < 0 or parametro["encargos_kwh"] < 0 or parametro["tarifa_fallback_kwh"] < 0:
             continue
 
-        parametros_por_host[hostname] = parametro
+        parametros_por_id[id_node_lido] = parametro
 
-    if not parametros_por_host:
-        print("Billing: nenhum parâmetro válido retornado pelo endpoint; usando parâmetros locais padrão.")
-        return {"parametros": {}, "empresa_id": empresa_id_api}
+    if not parametros_por_id:
+        return tratar_erro_parametros_api("nenhum parâmetro válido retornado pelo endpoint")
 
-    parametros = {}
-    for info in catalogo.values():
-        hostname = str(info.get("hostname", "")).strip()
-        id_node = int(info.get("id_node", 0))
-        parametro = parametros_por_host.get(hostname)
-        if id_node > 0 and parametro:
-            parametros[id_node] = parametro
-
-    if parametros:
-        print(f"Billing: {len(parametros)} nodes com parâmetros vindos do site.")
-    return {"parametros": parametros, "empresa_id": empresa_id_api}
+    print(f"Billing: {len(parametros_por_id)} nodes com parâmetros vindos do site.")
+    return {
+        "parametros": parametros_por_id,
+        "empresa_id": empresa_id_api,
+        "hostnames_empresa": hostnames_empresa,
+        "catalogo_api": catalogo_api,
+    }
 
 
 def carregar_tarifas_energia_externa(inicio, fim):
@@ -3214,50 +3267,6 @@ def montar_registros_billing_sinteticos(catalogo, parametros, inicio, fim, mapa_
     return registros
 
 
-def sintetizar_alertas_billing(df_horas):
-    if df_horas.empty or not BILLING_GERAR_ALERTAS:
-        base = df_horas.copy()
-        base["aviso_hora"] = 0
-        base["critico_hora"] = 0
-        return base
-
-    estat = df_horas.groupby("id_node", as_index=False).agg(
-        media_custo=("custo_estimado", "mean"),
-        desvio_custo=("custo_estimado", "std"),
-        media_consumo=("consumo_kwh", "mean"),
-        desvio_consumo=("consumo_kwh", "std"),
-        media_tarifa=("tarifa_kwh", "mean"),
-        desvio_tarifa=("tarifa_kwh", "std"),
-    )
-    for coluna in ("desvio_custo", "desvio_consumo", "desvio_tarifa"):
-        estat[coluna] = estat[coluna].fillna(0.0).clip(lower=0.02)
-
-    df = df_horas.merge(estat, on="id_node", how="left")
-    df["pressao"] = ((df["consumo_kwh"] - df["media_consumo"]) / df["desvio_consumo"]) + (
-        (df["tarifa_kwh"] - df["media_tarifa"]) / df["desvio_tarifa"]
-    )
-
-    critico_cond = (
-        (df["pressao"] >= 2.4)
-        | (df["custo_estimado"] >= (df["media_custo"] + df["desvio_custo"] * 1.20))
-        | (df["media_cpu_pct"] >= 90)
-    )
-    aviso_cond = (
-        critico_cond
-        | (df["pressao"] >= 1.3)
-        | (df["custo_estimado"] >= (df["media_custo"] + df["desvio_custo"] * 0.70))
-        | (df["media_cpu_pct"] >= 75)
-    )
-
-    chave = df.apply(lambda r: f"{int(r.id_node)}-{r.timestamp.strftime('%Y%m%d%H')}".encode("utf-8"), axis=1)
-    modulo = chave.map(lambda texto: zlib.crc32(texto) % 12)
-
-    df["critico_hora"] = ((critico_cond & (modulo <= 2))).astype(int)
-    df["aviso_hora"] = ((aviso_cond & (modulo <= 6))).astype(int)
-    df.loc[df["critico_hora"] == 1, "aviso_hora"] = 0
-    return df
-
-
 def mes_ref(data):
     return f"{int(data.year):04d}-{int(data.month):02d}"
 
@@ -3339,6 +3348,21 @@ def montar_payload_mes(df_mes, metricas_mes_anterior):
     primeiro = diarios.iloc[0]["dia"]
     ultimo = diarios.iloc[-1]["dia"]
     chave_mes = mes_ref(primeiro)
+
+    diarios_grafico1 = diarios.copy()
+    corte_grafico1_aplicado = False
+    if BILLING_CORTAR_GRAFICO1_1512:
+        try:
+            ano_mes, mes_mes = [int(parte) for parte in chave_mes.split("-")]
+            if mes_mes == 11:
+                limite_grafico = pd.Timestamp(year=ano_mes, month=11, day=15).date()
+                filtrado = diarios[diarios["dia"].apply(lambda dia: pd.Timestamp(dia).date() <= limite_grafico)].copy()
+                if not filtrado.empty and len(filtrado) < len(diarios):
+                    diarios_grafico1 = filtrado
+                    corte_grafico1_aplicado = True
+        except Exception:
+            corte_grafico1_aplicado = False
+
     dias_no_mes = pd.Period(chave_mes, freq="M").days_in_month
     ultimo_dia_mes = pd.Timestamp(year=int(primeiro.year), month=int(primeiro.month), day=int(dias_no_mes)).date()
     ultimo_dia_real = pd.Timestamp(ultimo).date()
@@ -3346,6 +3370,14 @@ def montar_payload_mes(df_mes, metricas_mes_anterior):
     if ultimo_dia_real < ultimo_dia_mes:
         faixa_projecao = pd.date_range(ultimo_dia_real + pd.Timedelta(days=1), ultimo_dia_mes, freq="D")
         dias_projecao = [dia.strftime("%d/%m") for dia in faixa_projecao.tolist()]
+
+    primeiro_g1 = diarios_grafico1.iloc[0]["dia"]
+    ultimo_g1 = diarios_grafico1.iloc[-1]["dia"]
+    ultimo_dia_real_g1 = pd.Timestamp(ultimo_g1).date()
+    dias_projecao_g1 = []
+    if ultimo_dia_real_g1 < ultimo_dia_mes:
+        faixa_projecao_g1 = pd.date_range(ultimo_dia_real_g1 + pd.Timedelta(days=1), ultimo_dia_mes, freq="D")
+        dias_projecao_g1 = [dia.strftime("%d/%m") for dia in faixa_projecao_g1.tolist()]
 
     return {
         "periodoMensal": {
@@ -3357,6 +3389,18 @@ def montar_payload_mes(df_mes, metricas_mes_anterior):
             "dias": [dia.strftime("%d/%m") for dia in diarios["dia"].tolist()],
             "custos": [round(float(valor), 2) for valor in diarios["custo_dia"].tolist()],
             "diasProjecao": dias_projecao
+        },
+        "grafico1": {
+            "corte1511Ativo": bool(corte_grafico1_aplicado),
+            "historicoDiario": {
+                "dias": [dia.strftime("%d/%m") for dia in diarios_grafico1["dia"].tolist()],
+                "custos": [round(float(valor), 2) for valor in diarios_grafico1["custo_dia"].tolist()],
+                "diasProjecao": dias_projecao_g1
+            },
+            "alertasDiarios": {
+                "aviso": [int(v) for v in diarios_grafico1["aviso"].tolist()],
+                "critico": [int(v) for v in diarios_grafico1["critico"].tolist()]
+            }
         },
         "alertasDiarios": {
             "aviso": [int(v) for v in diarios["aviso"].tolist()],
@@ -3388,7 +3432,8 @@ def publicar_billing_no_s3(s3, bucket, registros, inicio, fim):
     if getattr(serie_mes.dt, "tz", None) is not None:
         serie_mes = serie_mes.dt.tz_localize(None)
     df["mes"] = serie_mes.dt.to_period("M").astype(str)
-    df = sintetizar_alertas_billing(df)
+    df["aviso_hora"] = 0
+    df["critico_hora"] = 0
     estado_saida = {"modo": "s3", "motivo": None}
 
     total_arquivos = 0
@@ -3436,11 +3481,15 @@ def executar_billing():
     agora = pd.Timestamp.now(tz=FUSO)
     ano_ref = ano_referencia_setembro(agora)
     inicio = pd.Timestamp(year=ano_ref, month=9, day=1, hour=0, minute=0, second=0, tz=FUSO)
-    fim = limite_demo_projecao(agora)
+    fim_execucao = limite_sintetico_billing(agora)
+    fim_sintetico = limite_sintetico_billing(agora)
 
     s3 = boto3.client("s3", region_name=os.getenv("AWS_REGION", os.getenv("REGION_NAME", "us-east-1")))
     bucket = os.environ["BUCKET_NAME"]
-    mapa_tarifas = montar_mapa_tarifas(inicio, fim)
+    mapa_tarifas = montar_mapa_tarifas(inicio, fim_execucao)
+    if BILLING_USAR_DADOS_SINTETICOS and BILLING_FIXAR_CUSTO_SINTETICO:
+        mapa_tarifas = {}
+        print("Billing: custo sintético fixo ativado (tarifa horária usa fallback constante).")
 
     try:
         df = carregar_silver_billing(s3, bucket, agora, inicio=inicio, colunas=COLUNAS)
@@ -3454,32 +3503,64 @@ def executar_billing():
     if df.empty:
         raise ValueError("Sem hosts na Silver para montar o Billing.")
 
-    df = expandir_df_para_hosts_demo(df, BILLING_HOSTNAMES_DEMO)
+    if BILLING_EXPANDIR_HOSTS_DEMO:
+        df = expandir_df_para_hosts_demo(df, BILLING_HOSTNAMES_DEMO)
     catalogo = catalogo_billing_de_dataframe(df)
-    df_reais_ate_limite = df[df["TIMESTAMP"] <= fim].copy()
-    if df_reais_ate_limite.empty:
-        print("Billing: sem dados reais até 15/11; usando histórico sintético para o período da apresentação.")
 
-    parametros = parametros_billing_padrao(catalogo)
-    resposta_parametros_api = carregar_parametros_billing_api(catalogo)
+    resposta_parametros_api = carregar_parametros_billing_api()
     parametros_api = resposta_parametros_api.get("parametros", {})
     empresa_id_api = resposta_parametros_api.get("empresa_id")
+    hostnames_empresa_api = resposta_parametros_api.get("hostnames_empresa") or []
+    catalogo_api = resposta_parametros_api.get("catalogo_api") or {}
+
+    if catalogo_api:
+        empresa_padrao = int(os.getenv("BILLING_EMPRESA_PADRAO", "1"))
+        empresa_catalogo = int(empresa_id_api) if isinstance(empresa_id_api, int) and empresa_id_api > 0 else empresa_padrao
+        catalogo = {
+            host: {
+                "id_node": int(info["id_node"]),
+                "hostname": host,
+                "id_cluster": 0,
+                "id_ambiente_hpc": None,
+                "id_empresa": empresa_catalogo,
+            }
+            for host, info in sorted(catalogo_api.items(), key=lambda item: item[0])
+        }
+        print(f"Billing: catálogo carregado da API com {len(catalogo)} nodes da empresa autenticada.")
+
+    if hostnames_empresa_api:
+        permitidos = set(hostnames_empresa_api)
+        catalogo = {host: info for host, info in catalogo.items() if host in permitidos}
+        if not catalogo:
+            raise ValueError("Sem nodes da empresa autenticada para gerar Billing.")
+        print(f"Billing: escopo de nodes limitado à empresa autenticada ({len(catalogo)} nodes).")
+
     if isinstance(empresa_id_api, int) and empresa_id_api > 0:
         for info in catalogo.values():
             info["id_empresa"] = empresa_id_api
         print(f"Billing: empresa autenticada na API = {empresa_id_api}; IDs de empresa sincronizados no catálogo.")
+
+    hosts_catalogo = set(catalogo.keys())
+    df_reais_ate_limite = df[(df["TIMESTAMP"] <= fim_execucao) & (df["HOSTNAME"].astype(str).isin(hosts_catalogo))].copy()
+    if df_reais_ate_limite.empty and BILLING_USAR_DADOS_SINTETICOS:
+        print("Billing: sem dados reais no período; usando histórico sintético para composição.")
+
+    parametros = parametros_billing_padrao(catalogo)
     if parametros_api:
         parametros.update(parametros_api)
 
-    registros_sinteticos = montar_registros_billing_sinteticos(catalogo, parametros, inicio, fim, mapa_tarifas)
+    registros_sinteticos = []
+    if BILLING_USAR_DADOS_SINTETICOS:
+        registros_sinteticos = montar_registros_billing_sinteticos(catalogo, parametros, inicio, fim_sintetico, mapa_tarifas)
     registros_reais = montar_registros_billing_reais(df_reais_ate_limite, catalogo, parametros, mapa_tarifas)
     registros = mesclar_registros_billing(registros_sinteticos, registros_reais)
 
-    resultado = publicar_billing_no_s3(s3, bucket, registros, inicio, fim)
+    resultado = publicar_billing_no_s3(s3, bucket, registros, inicio, fim_execucao)
     return {
         "modo": BILLING_MODO,
         "inicio": inicio.isoformat(),
-        "fim": fim.isoformat(),
+        "fim": fim_execucao.isoformat(),
+        "fim_sintetico": fim_sintetico.isoformat(),
         "nodes": len(catalogo),
         "registros_processados": len(registros),
         "arquivos_publicados": resultado["arquivos"],

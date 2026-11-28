@@ -1,4 +1,5 @@
 from config_aws import *
+import json
 import requests
 import psutil as p
 import time
@@ -16,7 +17,7 @@ from injecao_incidentes import InjetorIncidentes, gravar_rotulos
 
 host = os.getenv('AUTH_HOSTNAME', 'alpha-node01').strip()
 injetor = InjetorIncidentes(host)
-url_auth = os.getenv('AUTH_URL', 'http://localhost:8080/auth/').rstrip('/')
+url_auth = os.getenv('AUTH_URL', 'http://localhost:3333/auth/').rstrip('/')
 url_credenciais = url_auth + '/credenciais'
 credenciais_login = None
 empresa_id_autenticada = None
@@ -206,6 +207,7 @@ INTERVALO = 10
 LOTE = 6 
 BILLING_LOCAL_DIR = Path(__file__).resolve().parent / 'silver_local'
 SALVAR_BILLING_LOCAL = os.getenv('SALVAR_BILLING_LOCAL', 'true').lower() == 'true'
+AUTH_CONTEXT_PATH = Path(__file__).resolve().parent / 'silver_local' / '.auth_context.json'
 
 
 def salvar_copia_billing_local(caminho_origem, nome_arquivo):
@@ -214,6 +216,20 @@ def salvar_copia_billing_local(caminho_origem, nome_arquivo):
     BILLING_LOCAL_DIR.mkdir(parents=True, exist_ok=True)
     destino = BILLING_LOCAL_DIR / nome_arquivo
     shutil.copy2(caminho_origem, str(destino))
+
+
+def salvar_contexto_autenticacao_local(email, senha, hostname, empresa_id):
+    try:
+        AUTH_CONTEXT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        AUTH_CONTEXT_PATH.write_text(json.dumps({
+            'email': email,
+            'senha': senha,
+            'hostname': hostname,
+            'empresa_id': empresa_id,
+            'salvo_em': datetime.now().isoformat()
+        }, ensure_ascii=False), encoding='utf-8')
+    except Exception as erro:
+        logging.warning('Nao foi possivel salvar contexto de autenticacao local (%s).', type(erro).__name__)
 
 def enviar_lote(linhas, rotulos=None):
     momento = datetime.now()
@@ -327,6 +343,7 @@ if __name__ == '__main__':
 
         if res.get('autenticado'):
             empresa_id_autenticada = res.get('empresa_id')
+            salvar_contexto_autenticacao_local(email, password, host, empresa_id_autenticada)
             print('\nAutenticação realizada com sucesso!')
             escrita()
 
