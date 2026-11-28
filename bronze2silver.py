@@ -166,7 +166,7 @@ if __name__ == '__main__':
     except Exception as e:
         print(f"Erro durante a execução da ETL: {e}")
 
-    # finally:
-    #     shutil.rmtree('raw_local', ignore_errors=True)
-    #     shutil.rmtree('silver_local', ignore_errors=True)
-    #     print('Arquivos locais temporários removidos!')
+    finally:
+        shutil.rmtree('raw_local', ignore_errors=True)
+        shutil.rmtree('silver_local', ignore_errors=True)
+        print('Arquivos locais temporários removidos!')

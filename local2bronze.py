@@ -154,7 +154,6 @@ cabecalho = [
     'TIMESTAMP',
     'HOSTNAME',
     'USER',
-    'EMPRESA_ID',
 
     'CPU_PERCENT',
     'CPU_USER_PERCENT',
@@ -183,7 +182,8 @@ cabecalho = [
     'DISCO_USED',
     'DISCO_FREE'
 ]
-usuario = os.environ.get('USER') or os.environ.get('USERNAME') or 'Desconhecido'
+
+usuario = 'pretrobras'
 
 def upload_file(file_name, bucket, object_name):
     try:
@@ -238,7 +238,7 @@ def enviar_lote(linhas, rotulos=None):
 
 
     objeto = (
-        f"{os.getenv('FILE_KEY')}/"
+        f"{os.getenv('FILE_KEY')}"
         f'hostname={host}/ano={momento:%Y}/mes={momento:%m}/dia={momento:%d}/'
         f'{nome_caminho}'
     )
@@ -283,7 +283,6 @@ def escrita():
                 timestamp,
                 host,
                 usuario,
-                empresa_id_autenticada,
 
                 *cpu,
                 *ram,
